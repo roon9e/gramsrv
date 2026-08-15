@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /app
+
+RUN apk add --no-cache git ca-certificates tzdata
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o bin/telesrv ./cmd/telesrv && \
+    if [ -d "./cmd/telesrv-admin" ]; then \
+      CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o bin/telesrv-admin ./cmd/telesrv-admin; \
+    fi && \
+    if [ -d "./cmd/telegramloginkeygen" ]; then \
+      CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o bin/telegramloginkeygen ./cmd/telegramloginkeygen; \
+    fi
+
+FROM alpine:3.20 AS runner
+
+WORKDIR /app
+
+RUN apk add --no-cache ca-certificates tzdata openssl bash ffmpeg
+
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /app/bin/ /app/bin/
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+
+RUN chmod +x /app/docker-entrypoint.sh && \
+    mkdir -p /app/data /app/storage
+
+EXPOSE 2398 2400 2401 6060 8088 12399/udp 12400/udp 12500-12999/udp
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["/app/bin/telesrv"]
