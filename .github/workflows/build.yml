@@ -1,0 +1,67 @@
+name: Build Linux AMD64 Binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build linux/amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: cmd/telesrv-admin/web/package-lock.json
+
+      - name: Build admin web assets
+        working-directory: cmd/telesrv-admin/web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Build binaries
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o dist/gramsrv ./cmd/telesrv
+          go build -trimpath -ldflags="-s -w" -o dist/gramsrv-admin ./cmd/telesrv-admin
+          sha256sum dist/gramsrv dist/gramsrv-admin > dist/SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gramsrv-linux-amd64
+          path: |
+            dist/gramsrv
+            dist/gramsrv-admin
+            dist/SHA256SUMS
+          retention-days: 7
