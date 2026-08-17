@@ -1,4 +1,4 @@
-name: Build Linux AMD64 Binaries
+name: Build and Release
 
 on:
   workflow_dispatch:
@@ -14,10 +14,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
   build:
-    name: Build linux/amd64
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
 
     steps:
       - name: Checkout
@@ -48,20 +65,66 @@ jobs:
       - name: Build binaries
         env:
           CGO_ENABLED: '0'
-          GOOS: linux
-          GOARCH: amd64
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o dist/gramsrv ./cmd/telesrv
-          go build -trimpath -ldflags="-s -w" -o dist/gramsrv-admin ./cmd/telesrv-admin
-          sha256sum dist/gramsrv dist/gramsrv-admin > dist/SHA256SUMS
 
-      - name: Upload artifact
+          suffix=""
+          if [ "${GOOS}" = "windows" ]; then
+            suffix=".exe"
+          fi
+
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o "dist/gramsrv-${GOOS}-${GOARCH}${suffix}" \
+            ./cmd/telesrv
+
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o "dist/gramsrv-admin-${GOOS}-${GOARCH}${suffix}" \
+            ./cmd/telesrv-admin
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gramsrv-linux-amd64
-          path: |
-            dist/gramsrv
-            dist/gramsrv-admin
-            dist/SHA256SUMS
+          name: gramsrv-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
           retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - ci
+      - build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gramsrv-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate combined checksums
+        working-directory: dist
+        run: |
+          sha256sum gramsrv-* > SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            dist/* \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
