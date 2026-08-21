@@ -1,0 +1,211 @@
+name: telesrv
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: telesrv-postgres
+    command:
+      - "postgres"
+      - "-c"
+      - "max_locks_per_transaction=512"
+      - "-c"
+      - "shared_preload_libraries=pg_stat_statements"
+      - "-c"
+      - "pg_stat_statements.track=all"
+      - "-c"
+      - "track_io_timing=on"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-telesrv}
+      POSTGRES_USER: ${POSTGRES_USER:-telesrv}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TZ: UTC
+    ports:
+      - "${TELESRV_LOCAL_LISTEN_IP:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-telesrv} -d ${POSTGRES_DB:-telesrv}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - telesrv-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: telesrv-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${TELESRV_LOCAL_LISTEN_IP:-127.0.0.1}:${REDIS_PORT:-6399}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - telesrv-net
+
+  telesrv-file:
+    image: ${TELESRV_IMAGE:-ghcr.io/roon9e/gramsrv:latest}
+    container_name: telesrv-file
+    command: ["telesrv-file", "--config", "/app/configs/docker/file.yaml"]
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./configs/docker:/app/configs/docker:ro
+    restart: unless-stopped
+    networks:
+      - telesrv-net
+
+  telesrv-core:
+    image: ${TELESRV_IMAGE:-ghcr.io/roon9e/gramsrv:latest}
+    container_name: telesrv-core
+    command: ["telesrv-core", "--config", "/app/configs/docker/core.yaml"]
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      telesrv-file:
+        condition: service_started
+    ports:
+      - "${TELESRV_LISTEN_IP:-0.0.0.0}:${TELESRV_PUBLIC_LINK_PORT:-2401}:2401"
+      - "${TELESRV_LISTEN_IP:-0.0.0.0}:${TELESRV_BOT_API_PORT:-8088}:8088"
+    volumes:
+      - ./data:/app/data
+      - ./configs/docker:/app/configs/docker:ro
+    restart: unless-stopped
+    networks:
+      - telesrv-net
+
+  telesrv-egress:
+    image: ${TELESRV_IMAGE:-ghcr.io/roon9e/gramsrv:latest}
+    container_name: telesrv-egress
+    command: ["telesrv-egress", "--config", "/app/configs/docker/egress.yaml"]
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      telesrv-core:
+        condition: service_started
+    volumes:
+      - ./configs/docker:/app/configs/docker:ro
+    restart: unless-stopped
+    networks:
+      - telesrv-net
+
+  telesrv-sfu:
+    image: ${TELESRV_IMAGE:-ghcr.io/roon9e/gramsrv:latest}
+    container_name: telesrv-sfu
+    command: ["telesrv-sfu", "--config", "/app/configs/docker/sfu.yaml"]
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      telesrv-core:
+        condition: service_started
+    ports:
+      - "${TELESRV_LISTEN_IP:-0.0.0.0}:${TELESRV_SFU_UDP_PORT:-12399}:12399/udp"
+    volumes:
+      - ./configs/docker:/app/configs/docker:ro
+    restart: unless-stopped
+    networks:
+      - telesrv-net
+
+  telesrv-edge:
+    image: ${TELESRV_IMAGE:-ghcr.io/roon9e/gramsrv:latest}
+    container_name: telesrv-edge
+    command: ["telesrv-edge", "--config", "/app/configs/docker/edge.yaml"]
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      telesrv-core:
+        condition: service_started
+      telesrv-file:
+        condition: service_started
+      telesrv-egress:
+        condition: service_started
+    ports:
+      - "${TELESRV_LISTEN_IP:-0.0.0.0}:${TELESRV_EDGE_PORT:-2398}:2398"
+    volumes:
+      - ./data:/app/data
+      - ./configs/docker:/app/configs/docker:ro
+    restart: unless-stopped
+    networks:
+      - telesrv-net
+
+  telesrv-admin:
+    image: ${TELESRV_IMAGE:-ghcr.io/roon9e/gramsrv:latest}
+    container_name: telesrv-admin
+    command: ["telesrv-admin", "--config", "/app/configs/docker/admin.yaml"]
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      telesrv-core:
+        condition: service_started
+    ports:
+      - "${TELESRV_LOCAL_LISTEN_IP:-127.0.0.1}:${TELESRV_ADMIN_UI_PORT:-2600}:2600"
+    volumes:
+      - ./data:/app/data
+      - ./configs/docker:/app/configs/docker:ro
+    restart: unless-stopped
+    networks:
+      - telesrv-net
+
+  telesrv-update:
+    image: ${TELESRV_IMAGE:-ghcr.io/roon9e/gramsrv:latest}
+    container_name: telesrv-update
+    command: ["telesrv-update", "--listen", "0.0.0.0:2402", "--manifest", "/app/data/updates/manifest.json", "--files", "/app/data/updates/files"]
+    ports:
+      - "${TELESRV_LISTEN_IP:-0.0.0.0}:${TELESRV_UPDATE_PORT:-2402}:2402"
+    volumes:
+      - ./data:/app/data:ro
+    restart: unless-stopped
+    networks:
+      - telesrv-net
+
+  telesrv-ton:
+    image: ${TELESRV_IMAGE:-ghcr.io/roon9e/gramsrv:latest}
+    container_name: telesrv-ton
+    profiles:
+      - ton
+    command: ["telesrv-ton", "--config", "/app/configs/docker/ton.yaml"]
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      telesrv-core:
+        condition: service_started
+    volumes:
+      - ./configs/docker:/app/configs/docker:ro
+    restart: unless-stopped
+    networks:
+      - telesrv-net
+
+networks:
+  telesrv-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
