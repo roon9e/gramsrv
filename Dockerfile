@@ -28,7 +28,9 @@ RUN mkdir -p /out && \
     go build -trimpath -ldflags="-s -w" -o /out/telesrv-sfu ./cmd/telesrv-sfu && \
     go build -trimpath -ldflags="-s -w" -o /out/telesrv-admin ./cmd/telesrv-admin && \
     go build -trimpath -ldflags="-s -w" -o /out/telesrv-update ./cmd/telesrv-update && \
+    go build -trimpath -ldflags="-s -w" -o /out/telesrv-update-publish ./cmd/telesrv-update-publish && \
     go build -trimpath -ldflags="-s -w" -o /out/telesrv-ton ./cmd/telesrv-ton && \
+    go build -trimpath -ldflags="-s -w" -o /out/telesrv-key-migrate ./cmd/telesrv-key-migrate && \
     go build -trimpath -ldflags="-s -w" -o /out/telegramloginkeygen ./cmd/telegramloginkeygen
 
 # Stage 2: Minimal target-platform runtime environment with ffmpeg, openssl, and certificates

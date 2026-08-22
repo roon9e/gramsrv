@@ -5,24 +5,35 @@ set -e
 # Telesrv Container Entrypoint Script
 # ==============================================================================
 
-# Ensure data directories exist on the host/volume
-mkdir -p \
-  /app/data/blobs \
-  /app/data/blob-staging \
-  /app/data/telegram-login \
-  /app/data/updates/files \
-  /app/data/maptiles \
-  /app/data/official-gifts \
-  /app/data/sticker-seed \
-  /app/data/premium-promo \
-  /app/data/langpack
+cmd_name="$(basename "${1:-}" 2>/dev/null || echo "${1:-}")"
+init_profile="${TELESRV_INIT_PROFILE:-none}"
+
+has_profile() {
+  case ",$init_profile," in
+    *",$1,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if has_profile storage; then
+  mkdir -p \
+    /app/data/blobs \
+    /app/data/blob-staging \
+    /app/data/telegram-login \
+    /app/data/updates/files \
+    /app/data/maptiles \
+    /app/data/official-gifts \
+    /app/data/sticker-seed \
+    /app/data/premium-promo \
+    /app/data/langpack
+fi
 
 # ------------------------------------------------------------------------------
 # 1. First-Run RSA Key Generation (server_rsa.pem & server_rsa.pub)
 # ------------------------------------------------------------------------------
-if [ ! -f "/app/data/server_rsa.pem" ]; then
+if has_profile server && [ ! -f "/app/data/server_rsa.pem" ]; then
   echo "[telesrv-entrypoint] Generating initial MTProto RSA private key..."
-  openssl genrsa -out /app/data/server_rsa.pem 2048
+  openssl genrsa -traditional -out /app/data/server_rsa.pem 2048
   chmod 600 /app/data/server_rsa.pem || true
   
   echo "[telesrv-entrypoint] Extracting server RSA public key (for client configuration)..."
@@ -30,10 +41,26 @@ if [ ! -f "/app/data/server_rsa.pem" ]; then
   echo "[telesrv-entrypoint] Server RSA public key saved to /app/data/server_rsa.pub"
 fi
 
+if has_profile server && [ -f "/app/data/server_rsa.pem" ]; then
+  if grep -q "BEGIN PRIVATE KEY" /app/data/server_rsa.pem; then
+    echo "[FATAL] /app/data/server_rsa.pem uses PKCS#8 format."
+    echo "        Run telesrv-key-migrate before starting the service."
+    exit 1
+  fi
+  if ! openssl rsa -in /app/data/server_rsa.pem -check -noout >/dev/null 2>&1; then
+    echo "[FATAL] /app/data/server_rsa.pem is not a PKCS#1 RSA private key."
+    echo "        Run telesrv-key-migrate before starting the service."
+    exit 1
+  fi
+  if [ ! -f "/app/data/server_rsa.pub" ]; then
+    openssl rsa -in /app/data/server_rsa.pem -pubout -out /app/data/server_rsa.pub >/dev/null 2>&1
+  fi
+fi
+
 # ------------------------------------------------------------------------------
 # 2. First-Run Telegram Login / OIDC Keys Provisioning
 # ------------------------------------------------------------------------------
-if [ ! -f "/app/data/telegram-login/signing-keys.json" ]; then
+if has_profile server && [ ! -f "/app/data/telegram-login/signing-keys.json" ]; then
   echo "[telesrv-entrypoint] Initializing Telegram Login OIDC key ring..."
   if command -v telegramloginkeygen >/dev/null 2>&1; then
     telegramloginkeygen -mode init -dir /app/data/telegram-login || {
@@ -55,8 +82,6 @@ validate_secret() {
     exit 1
   fi
 }
-
-cmd_name="$(basename "$1" 2>/dev/null || echo "$1")"
 
 case "$cmd_name" in
   telesrv-core|telesrv-egress|telesrv-file|telesrv-admin|telesrv-ton)

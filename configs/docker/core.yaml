@@ -72,7 +72,7 @@ translation:
   enabled: ${TELESRV_TRANSLATION_ENABLED}
 
 http:
-  bot_api_addr: 0.0.0.0:8088
+  bot_api_addr: 0.0.0.0:8081
   admin_api_addr: 0.0.0.0:2599
   admin_api_token: ${TELESRV_ADMIN_API_TOKEN}
   public_link_web_addr: 0.0.0.0:2401

@@ -22,6 +22,10 @@ curl -sSL -o .env.example https://raw.githubusercontent.com/roon9e/gramsrv/v2/.e
 # Download database initialization
 curl -sSL -o postgres-init/010_branch_databases.sql https://raw.githubusercontent.com/roon9e/gramsrv/v2/postgres-init/010_branch_databases.sql
 
+# Install update catalog
+mkdir -p data/updates/files
+curl -sSL -o data/updates/manifest.json https://raw.githubusercontent.com/roon9e/gramsrv/v2/deploy/update/manifest.example.json
+
 # Create production .env file
 cp .env.example .env
 ```
@@ -125,7 +129,7 @@ NAME                    STATUS              PORTS
 telesrv-postgres        Up (healthy)        127.0.0.1:5432->5432/tcp
 telesrv-redis           Up (healthy)        127.0.0.1:6399->6379/tcp
 telesrv-file            Up                  (no public ports)
-telesrv-core            Up                  0.0.0.0:2401->2401/tcp, 0.0.0.0:8088->8088/tcp
+telesrv-core            Up                  0.0.0.0:2401->2401/tcp, 0.0.0.0:8081->8081/tcp
 telesrv-edge            Up                  0.0.0.0:2398->2398/tcp
 telesrv-egress          Up                  (no public ports)
 telesrv-sfu             Up                  0.0.0.0:12399->12399/udp
@@ -206,6 +210,25 @@ At runtime, `docker-compose` mounts `./configs/docker/` into the container as `/
 - **Advanced use cases**: Custom logging formats, extended health check intervals, performance tuning, or adding experimental features.
 - **After modification**: Restart the affected container: `docker compose restart telesrv-core`.
 
+### Identity migration
+
+The normal service startup validates identity files but does not perform
+destructive migrations. To convert an older PKCS#8 RSA key explicitly, run:
+
+```bash
+docker run --rm \
+   -v "$PWD/data:/data" \
+   telesrv:latest \
+   telesrv-key-migrate \
+   -in /data/server_rsa.pem \
+   -out /data/server_rsa.pem
+```
+
+The command creates `/data/server_rsa.pem.before-pkcs1` before replacing the
+key. Back up the data directory first and restart the MTProto services after
+the migration. Service startup validates the key but does not migrate it
+automatically.
+
 ---
 
 ## 3. Network Security Architecture & UFW Safety
@@ -236,13 +259,13 @@ These ports are published to the host per `.env` settings:
 | telesrv-edge | `2398` | TCP | `0.0.0.0` | MTProto & WebSocket | `TELESRV_EDGE_PORT` |
 | telesrv-sfu | `12399` | UDP | `0.0.0.0` | WebRTC media | `TELESRV_SFU_UDP_PORT` |
 | telesrv-core | `2401` | TCP | `0.0.0.0` | Public links & login | `TELESRV_PUBLIC_LINK_PORT` |
-| telesrv-core | `8088` | TCP | `0.0.0.0` | Bot API HTTP | `TELESRV_BOT_API_PORT` |
+| telesrv-core | `8081` | TCP | `0.0.0.0` | Bot API HTTP | `TELESRV_BOT_API_PORT` |
 | telesrv-update | `2402` | TCP | `0.0.0.0` | Auto-update CDN | `TELESRV_UPDATE_PORT` |
 | telesrv-admin | `2600` | TCP | `127.0.0.1` | Admin web UI | `TELESRV_ADMIN_UI_PORT` |
 
 **Firewall Strategy:**
 
-- Open only required public ports: `2398/tcp`, `12399/udp`, `2401/tcp`, `8088/tcp`, `2402/tcp` (optional).
+- Open only required public ports: `2398/tcp`, `12399/udp`, `2401/tcp`, `8081/tcp`, `2402/tcp` (optional).
 - Keep admin UI (`2600`) bound to `127.0.0.1` and access via SSH tunnel: `ssh -L 2600:127.0.0.1:2600 user@server`.
 - Database and cache ports (`5432`, `6379`) bound to `127.0.0.1`; access for maintenance via SSH tunnel if needed.
 
@@ -255,7 +278,7 @@ sudo ufw allow 22/tcp                    # SSH
 sudo ufw allow 2398/tcp                  # telesrv-edge (MTProto)
 sudo ufw allow 12399/udp                 # telesrv-sfu (WebRTC)
 sudo ufw allow 2401/tcp                  # telesrv-core (public links)
-sudo ufw allow 8088/tcp                  # telesrv-core (bot API)
+sudo ufw allow 8081/tcp                  # telesrv-core (bot API)
 # sudo ufw allow 2402/tcp                # telesrv-update (optional)
 sudo ufw enable
 ```

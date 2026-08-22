@@ -154,7 +154,7 @@ API endpoint unless an explicit reverse-proxy route maps that domain to telesrv:
 | Name | Setting/source | Direction and purpose |
 |---|---|---|
 | Bot API listener | telesrv `TELESRV_BOT_API_ADDR` | The telesrv bind address; empty disables the gateway. `0.0.0.0` is valid only for binding and is not a client request target. |
-| Bot API base URL | the bot application's `TELEGRAM_API_URL` or equivalent | A client-reachable address for telesrv, for example `http://172.17.0.1:8088`. Method URLs are `<base>/bot<TOKEN>/<method>` and file URLs are `<base>/file/bot<TOKEN>/<file_path>`. |
+| Bot API base URL | the bot application's `TELEGRAM_API_URL` or equivalent | A client-reachable address for telesrv, for example `http://172.17.0.1:8081`. Method URLs are `<base>/bot<TOKEN>/<method>` and file URLs are `<base>/file/bot<TOKEN>/<file_path>`. |
 | Webhook receiver URL | the bot application's `WEBHOOK_URL + WEBHOOK_PATH`, registered by `setWebhook` | The target to which telesrv actively POSTs updates, for example `https://bot.example.com/webhook`. It is not the Bot API base URL. |
 
 The network direction is different too: polling is `bot application -> telesrv Bot API`, while
@@ -174,8 +174,8 @@ curl -sS -X POST \
 
 If the application uses a differently named variable, replace `TELEGRAM_API_URL` with the
 **client-reachable address** corresponding to `TELESRV_BOT_API_ADDR`. For example, if telesrv binds
-`0.0.0.0:8088`, a container on the same host might use `http://172.17.0.1:8088`; it must not request
-`http://0.0.0.0:8088`.
+`0.0.0.0:8081`, a container on the same host might use `http://172.17.0.1:8081`; it must not request
+`http://0.0.0.0:8081`.
 
 Interpret the result as follows:
 
