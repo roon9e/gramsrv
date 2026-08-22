@@ -1,6 +1,10 @@
 # Multi-stage Dockerfile for all telesrv microservices
-# Stage 1: Build all binaries using Go 1.25 on Alpine
-FROM golang:1.25-alpine AS builder
+# Stage 1: Build all binaries using Go 1.25 on the native build platform.
+# Go cross-compiles for the requested Docker target without emulating the builder.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /src
 RUN apk add --no-cache git
@@ -13,7 +17,9 @@ RUN go mod download
 COPY . .
 
 # Build all microservices and utility binaries with optimizations
-ENV CGO_ENABLED=0
+ENV CGO_ENABLED=0 \
+    GOOS=$TARGETOS \
+    GOARCH=$TARGETARCH
 RUN mkdir -p /out && \
     go build -trimpath -ldflags="-s -w" -o /out/telesrv-edge ./cmd/telesrv-edge && \
     go build -trimpath -ldflags="-s -w" -o /out/telesrv-core ./cmd/telesrv-core && \
@@ -25,8 +31,8 @@ RUN mkdir -p /out && \
     go build -trimpath -ldflags="-s -w" -o /out/telesrv-ton ./cmd/telesrv-ton && \
     go build -trimpath -ldflags="-s -w" -o /out/telegramloginkeygen ./cmd/telegramloginkeygen
 
-# Stage 2: Minimal runtime environment with ffmpeg, openssl, and certificates
-FROM alpine:3.21
+# Stage 2: Minimal target-platform runtime environment with ffmpeg, openssl, and certificates
+FROM --platform=$TARGETPLATFORM alpine:3.21
 
 RUN apk add --no-cache \
     ca-certificates \
