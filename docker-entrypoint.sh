@@ -24,8 +24,13 @@ if has_profile storage; then
     /app/data/maptiles \
     /app/data/official-gifts \
     /app/data/sticker-seed \
-    /app/data/premium-promo \
     /app/data/langpack
+  # /app/data/premium-promo is intentionally NOT pre-created here: it is an
+  # optional operator-provided export (help.getPremiumPromo videos), and
+  # SeedPremiumPromo treats a genuinely-absent directory as "not configured,
+  # skip" but a present-yet-manifest-less directory as a startup error (to
+  # catch real misconfiguration). Pre-creating it on every fresh install would
+  # crash-loop telesrv-core before an operator ever has a chance to populate it.
 fi
 
 # ------------------------------------------------------------------------------

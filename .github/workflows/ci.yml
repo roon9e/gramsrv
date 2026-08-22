@@ -31,6 +31,10 @@ jobs:
 
       - name: Validate Compose files
         run: |
+          # .env is gitignored (see docs/local-setup.md); compose only needs the
+          # file to exist to resolve env_file references during config validation,
+          # not real secrets.
+          cp .env.example .env
           docker compose config --quiet
           docker compose -f docker-compose-development.yml config --quiet
 
