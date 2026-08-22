@@ -75,13 +75,25 @@ jobs:
             suffix=".exe"
           fi
 
-          for role in edge core egress file sfu admin ton; do
+          found=0
+          for command_dir in cmd/telesrv-*; do
+            if [ ! -d "${command_dir}" ]; then
+              continue
+            fi
+
+            found=1
+            command_name="${command_dir#cmd/telesrv-}"
             go build \
               -trimpath \
               -ldflags="-s -w" \
-              -o "dist/gramsrv-${role}-${GOOS}-${GOARCH}${suffix}" \
-              "./cmd/telesrv-${role}"
+              -o "dist/gramsrv-${command_name}-${GOOS}-${GOARCH}${suffix}" \
+              "./${command_dir}"
           done
+
+          if [ "${found}" -eq 0 ]; then
+            echo "No cmd/telesrv-* command directories found" >&2
+            exit 1
+          fi
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
