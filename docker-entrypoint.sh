@@ -22,7 +22,7 @@ mkdir -p \
 # ------------------------------------------------------------------------------
 if [ ! -f "/app/data/server_rsa.pem" ]; then
   echo "[telesrv-entrypoint] Generating initial MTProto RSA private key..."
-  openssl genpkey -algorithm RSA -out /app/data/server_rsa.pem -pkeyopt rsa_keygen_bits:2048
+  openssl genrsa -out /app/data/server_rsa.pem 2048
   chmod 600 /app/data/server_rsa.pem || true
   
   echo "[telesrv-entrypoint] Extracting server RSA public key (for client configuration)..."
