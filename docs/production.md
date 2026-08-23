@@ -4,144 +4,125 @@ This guide covers deploying `telesrv` in production using the prebuilt multi-arc
 
 ---
 
-## 1. Quickstart (Deploy via `curl`)
+## 1. Quickstart
 
-You do **not** need to clone the full repository or install Go on your production server.
+You do **not** need to clone the full repository or install Go on your production server. Every
+per-service YAML config (`configs/docker/*.yaml`) is baked into the published image
+(`ghcr.io/roon9e/gramsrv:latest`), so the only two files you need are `docker-compose.yml` and `.env`.
 
-### Step 1: Download Deployment Files
-
-Create the required directory structure and download all necessary files:
+### Step 1: Download the compose file and env template
 
 ```bash
-mkdir -p telesrv/postgres-init telesrv/configs/docker && cd telesrv
-
-# Download main orchestration and configuration files
+mkdir -p telesrv && cd telesrv
 curl -sSL -o docker-compose.yml https://raw.githubusercontent.com/roon9e/gramsrv/v2/docker-compose.yml
 curl -sSL -o .env.example https://raw.githubusercontent.com/roon9e/gramsrv/v2/.env.example
-
-# Download database initialization
-curl -sSL -o postgres-init/010_branch_databases.sql https://raw.githubusercontent.com/roon9e/gramsrv/v2/postgres-init/010_branch_databases.sql
-
-# Install update catalog
-mkdir -p data/updates/files
-curl -sSL -o data/updates/manifest.json https://raw.githubusercontent.com/roon9e/gramsrv/v2/deploy/update/manifest.example.json
-
-# Create production .env file
 cp .env.example .env
 ```
 
-### Step 1b: Download Microservice Configuration Files (Critical)
+That's it for files — no `configs/docker/*.yaml`, no `postgres-init/`, no update manifest to fetch.
+(If you want to customize a service's YAML config without rebuilding the image, or you want the
+optional `main`+`v2` shared-Postgres init script, see [Advanced: overriding baked-in
+configs](#advanced-overriding-baked-in-configs) below — neither is required for a normal deploy.)
 
-**This step is essential.** Each microservice requires a YAML configuration file that specifies logging, gRPC ports, database connections, and other runtime parameters.
+### Step 2: Fill in `.env`
 
+`.env.example` ships every required secret as `CHANGEME`. **`docker-entrypoint.sh` refuses to start
+any service that still has a secret set to `CHANGEME` or left empty** — you'll get a clear
+`[FATAL] Required configuration secret '...' is missing or unconfigured` message naming exactly which
+variable to fix, instead of a service silently running with a blank password.
+
+Generate real values for every `CHANGEME` (Linux/macOS):
 ```bash
-# Download all microservice YAML configs
-for file in admin.yaml core.yaml edge.yaml egress.yaml file.yaml sfu.yaml ton.yaml; do \
-  curl -sSL -o "configs/docker/${file}" "https://raw.githubusercontent.com/roon9e/gramsrv/v2/configs/docker/${file}"; \
-done
-```
-
-**Why this step is necessary:**
-
-- The `docker-compose.yml` file specifies `command: ["telesrv-edge", "--config", "/app/configs/docker/edge.yaml"]` for each service.
-- Each `.yaml` file configures service-specific behavior: logging levels, gRPC bind addresses, health check intervals, connection pooling, and more.
-- Without these files, services will fail at startup with "config file not found" errors.
-- Configs are mounted as read-only volumes: `./configs/docker:/app/configs/docker:ro`.
-
-**Config substitution:**
-
-Each YAML file contains environment variable placeholders (e.g., `${TELESRV_REDIS_ADDR}`, `${POSTGRES_PASSWORD}`) that are substituted from your `.env` file **by the containers at runtime**. This allows a single set of YAML templates to work across all deployments.
-
-**Alternative (if manual download is preferred):**
-
-Instead of the loop, you can download configs individually or via your preferred CI/CD system:
-```bash
-curl -sSL -o configs/docker/core.yaml https://raw.githubusercontent.com/roon9e/gramsrv/v2/configs/docker/core.yaml
-curl -sSL -o configs/docker/edge.yaml https://raw.githubusercontent.com/roon9e/gramsrv/v2/configs/docker/edge.yaml
-# ... repeat for admin.yaml, egress.yaml, file.yaml, sfu.yaml, ton.yaml
-```
-
-### Step 2: Generate Cryptographic Secrets via `sed`
-
-Run this automated one-liner to generate high-entropy, random secrets for all databases, inter-service tokens, and admin session keys:
-
-```bash
-POSTGRES_PW=$(openssl rand -hex 16)
-ADMIN_PW=$(openssl rand -base64 16)
-
 sed -i \
-  -e "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=${POSTGRES_PW}/" \
-  -e "s/^TELESRV_CORE_EXEC_TOKEN=.*/TELESRV_CORE_EXEC_TOKEN=$(openssl rand -hex 24)/" \
-  -e "s/^TELESRV_FILE_TOKEN=.*/TELESRV_FILE_TOKEN=$(openssl rand -hex 24)/" \
-  -e "s/^TELESRV_EGRESS_ACK_TOKEN=.*/TELESRV_EGRESS_ACK_TOKEN=$(openssl rand -hex 24)/" \
-  -e "s/^TELESRV_GROUPCALL_CONTROL_TOKEN=.*/TELESRV_GROUPCALL_CONTROL_TOKEN=$(openssl rand -hex 24)/" \
-  -e "s/^TELESRV_SFU_CONTROL_TOKEN=.*/TELESRV_SFU_CONTROL_TOKEN=$(openssl rand -hex 24)/" \
-  -e "s/^TELESRV_ADMIN_API_TOKEN=.*/TELESRV_ADMIN_API_TOKEN=$(openssl rand -hex 24)/" \
-  -e "s/^TELESRV_ADMIN_UI_PASSWORD=.*/TELESRV_ADMIN_UI_PASSWORD=${ADMIN_PW}/" \
-  -e "s/^TELESRV_ADMIN_SESSION_KEY=.*/TELESRV_ADMIN_SESSION_KEY=$(openssl rand -hex 32)/" \
+  -e "s/^POSTGRES_PASSWORD=CHANGEME/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" \
+  -e "s/^TELESRV_CORE_EXEC_TOKEN=CHANGEME/TELESRV_CORE_EXEC_TOKEN=$(openssl rand -hex 24)/" \
+  -e "s/^TELESRV_FILE_TOKEN=CHANGEME/TELESRV_FILE_TOKEN=$(openssl rand -hex 24)/" \
+  -e "s/^TELESRV_EGRESS_ACK_TOKEN=CHANGEME/TELESRV_EGRESS_ACK_TOKEN=$(openssl rand -hex 24)/" \
+  -e "s/^TELESRV_GROUPCALL_CONTROL_TOKEN=CHANGEME/TELESRV_GROUPCALL_CONTROL_TOKEN=$(openssl rand -hex 24)/" \
+  -e "s/^TELESRV_SFU_CONTROL_TOKEN=CHANGEME/TELESRV_SFU_CONTROL_TOKEN=$(openssl rand -hex 24)/" \
+  -e "s/^TELESRV_ADMIN_API_TOKEN=CHANGEME/TELESRV_ADMIN_API_TOKEN=$(openssl rand -hex 24)/" \
+  -e "s/^TELESRV_ADMIN_UI_PASSWORD=CHANGEME/TELESRV_ADMIN_UI_PASSWORD=$(openssl rand -base64 16)/" \
+  -e "s/^TELESRV_ADMIN_SESSION_KEY=CHANGEME/TELESRV_ADMIN_SESSION_KEY=$(openssl rand -hex 32)/" \
   .env
-
-echo "Generated random Admin UI password: ${ADMIN_PW}"
+grep -c CHANGEME .env   # should print 0
 ```
 
-**Windows PowerShell Alternative:**
-
+**Windows PowerShell:**
 ```powershell
-Copy-Item .env.example .env
-$pgPw = -join ((1..32) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
-$adminPw = -join ((1..24) | ForEach-Object { [char](Get-Random -Min 65 -Max 122) })
 (Get-Content .env) `
-  -replace '^POSTGRES_PASSWORD=.*', "POSTGRES_PASSWORD=$pgPw" `
-  -replace '^TELESRV_CORE_EXEC_TOKEN=.*', "TELESRV_CORE_EXEC_TOKEN=$(-join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" `
-  -replace '^TELESRV_FILE_TOKEN=.*', "TELESRV_FILE_TOKEN=$(-join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" `
-  -replace '^TELESRV_EGRESS_ACK_TOKEN=.*', "TELESRV_EGRESS_ACK_TOKEN=$(-join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" `
-  -replace '^TELESRV_GROUPCALL_CONTROL_TOKEN=.*', "TELESRV_GROUPCALL_CONTROL_TOKEN=$(-join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" `
-  -replace '^TELESRV_SFU_CONTROL_TOKEN=.*', "TELESRV_SFU_CONTROL_TOKEN=$(-join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" `
-  -replace '^TELESRV_ADMIN_API_TOKEN=.*', "TELESRV_ADMIN_API_TOKEN=$(-join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" `
-  -replace '^TELESRV_ADMIN_UI_PASSWORD=.*', "TELESRV_ADMIN_UI_PASSWORD=$adminPw" `
-  -replace '^TELESRV_ADMIN_SESSION_KEY=.*', "TELESRV_ADMIN_SESSION_KEY=$(-join ((1..64) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" |
+  -replace '^POSTGRES_PASSWORD=CHANGEME', "POSTGRES_PASSWORD=$(-join ((1..32) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" `
+  -replace '^TELESRV_CORE_EXEC_TOKEN=CHANGEME', "TELESRV_CORE_EXEC_TOKEN=$(-join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" `
+  -replace '^TELESRV_FILE_TOKEN=CHANGEME', "TELESRV_FILE_TOKEN=$(-join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" `
+  -replace '^TELESRV_EGRESS_ACK_TOKEN=CHANGEME', "TELESRV_EGRESS_ACK_TOKEN=$(-join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" `
+  -replace '^TELESRV_GROUPCALL_CONTROL_TOKEN=CHANGEME', "TELESRV_GROUPCALL_CONTROL_TOKEN=$(-join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" `
+  -replace '^TELESRV_SFU_CONTROL_TOKEN=CHANGEME', "TELESRV_SFU_CONTROL_TOKEN=$(-join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" `
+  -replace '^TELESRV_ADMIN_API_TOKEN=CHANGEME', "TELESRV_ADMIN_API_TOKEN=$(-join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" `
+  -replace '^TELESRV_ADMIN_UI_PASSWORD=CHANGEME', "TELESRV_ADMIN_UI_PASSWORD=$(-join ((1..24) | ForEach-Object { [char](Get-Random -Min 65 -Max 122) }))" `
+  -replace '^TELESRV_ADMIN_SESSION_KEY=CHANGEME', "TELESRV_ADMIN_SESSION_KEY=$(-join ((1..64) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))" |
   Set-Content .env -Encoding UTF8
-Write-Host "Generated random Admin UI password: $adminPw"
 ```
 
-### Step 3: Configure Network & Public IP
+Values only need to be high-entropy and unique per deployment — the exact generator doesn't matter, and
+nothing you set here is ever overwritten by `docker-entrypoint.sh` on restart (it only ever *validates*
+that a real value is present; it never regenerates or replaces a secret you already filled in).
 
-Edit `.env` and configure:
-- `TELESRV_ADVERTISE_IP`: The public IP or reachable LAN IP of your server.
-- `TELESRV_PUBLIC_BASE_URL`: Public HTTPS/HTTP root (e.g. `https://telesrv.example.com`).
+Also set the network settings while you're in `.env`:
+- `TELESRV_ADVERTISE_IP`: the public IP or reachable LAN IP of your server.
+- `TELESRV_PUBLIC_BASE_URL`: public HTTPS/HTTP root (e.g. `https://telesrv.example.com`).
 
-See [configuration.en.md](configuration.en.md) (Section 1) for a complete reference of all network settings.
+See [configuration.en.md](configuration.en.md) (Section 1) for the complete network settings reference.
 
-### Step 4: Start the Stack
+### Step 3: Start the stack
 
 ```bash
-docker compose up -d
+docker compose up -d && docker compose logs -f
 ```
 
-Verify all containers are running:
+Everything else — RSA key generation, Postgres schema migration, per-service startup ordering — happens
+automatically inside the containers. `Ctrl-C` stops following logs without stopping the containers.
+
+### Step 4: Verify
+
 ```bash
-docker compose ps
+docker compose ps -a
 ```
 
-Expected output (simplified):
+Every service should read `Up ... (healthy)` once it settles (a fresh Postgres volume, first-run schema
+migration, and language-pack seeding can take a minute or two — `telesrv-core` in particular). `depends_on`
+conditions in `docker-compose.yml` mean services start in the right order automatically: `postgres`/`redis`
+→ `telesrv-file` → `telesrv-core` → `telesrv-egress`/`telesrv-sfu`/`telesrv-admin` → `telesrv-edge`.
+
+Expected output once settled:
 ```
 NAME                    STATUS              PORTS
 telesrv-postgres        Up (healthy)        127.0.0.1:5432->5432/tcp
 telesrv-redis           Up (healthy)        127.0.0.1:6399->6379/tcp
-telesrv-file            Up                  (no public ports)
-telesrv-core            Up                  0.0.0.0:2401->2401/tcp, 0.0.0.0:8081->8081/tcp
-telesrv-edge            Up                  0.0.0.0:2398->2398/tcp
-telesrv-egress          Up                  (no public ports)
-telesrv-sfu             Up                  0.0.0.0:12399->12399/udp
-telesrv-admin           Up                  127.0.0.1:2600->2600/tcp
+telesrv-file            Up (healthy)        (no public ports)
+telesrv-core            Up (healthy)        0.0.0.0:2401->2401/tcp, 0.0.0.0:8081->8081/tcp
+telesrv-edge            Up (healthy)        0.0.0.0:2398->2398/tcp
+telesrv-egress          Up (healthy)        (no public ports)
+telesrv-sfu             Up (healthy)        0.0.0.0:12399->12399/udp
+telesrv-admin           Up (healthy)        127.0.0.1:2600->2600/tcp
+telesrv-update          Up (healthy)        0.0.0.0:2402->2402/tcp
 ```
 
-Check logs:
+If any service isn't healthy, see [Section 5: Troubleshooting](#5-troubleshooting-deployment-issues) and
+[monitoring](#monitoring-logs--health) below.
+
+### Monitoring: logs & health
+
 ```bash
-docker compose logs -f telesrv-edge        # Watch client connection gateway
-docker compose logs -f telesrv-core        # Watch RPC dispatcher
-docker compose logs -f telesrv-admin       # Watch admin UI server
+docker compose ps -a                       # one-shot status + health for every container
+docker compose logs -f                     # follow all services interleaved
+docker compose logs -f telesrv-edge        # just the client connection gateway
+docker compose logs -f telesrv-core        # just the RPC dispatcher
+docker compose logs -f telesrv-admin       # just the admin UI server
+docker compose logs --since 10m telesrv-core   # only the last 10 minutes
 ```
+
+`docker compose ps -a` reports each container's health straight from its `healthcheck:` block in
+`docker-compose.yml` — every service that listens on a port has one, so `Up` without `(healthy)` (or
+`Restarting`) reliably means something is actually wrong, not just slow to log a ready message.
 
 ---
 
@@ -155,16 +136,6 @@ telesrv/
 ├── docker-compose.yml                     # Service definitions
 ├── .env.example                           # Template (reference only)
 ├── .env                                   # Your production configuration
-├── postgres-init/
-│   └── 010_branch_databases.sql           # PostgreSQL initialization
-├── configs/docker/                        # Service YAML configs (required)
-│   ├── core.yaml
-│   ├── edge.yaml
-│   ├── file.yaml
-│   ├── egress.yaml
-│   ├── admin.yaml
-│   ├── sfu.yaml
-│   └── ton.yaml
 └── data/                                  # Persistent state (created on first run)
     ├── server_rsa.pem                     # MTProto RSA private key (auto-generated)
     ├── server_rsa.pub                     # Public key for clients
@@ -173,6 +144,10 @@ telesrv/
     ├── official-gifts/                    # Star Gift catalogs
     └── ...
 ```
+
+`configs/docker/*.yaml` and the optional Postgres init script are **not** part of this directory —
+they're baked into the image and only need to exist on disk if you're deliberately overriding them (see
+[Advanced: overriding baked-in configs](#advanced-overriding-baked-in-configs)).
 
 ### Environment Variables (`.env`)
 
@@ -202,13 +177,40 @@ app:
     addr: ${TELESRV_GROUPCALL_CONTROL_ADDR:-0.0.0.0:2420}
 ```
 
-At runtime, `docker-compose` mounts `./configs/docker/` into the container as `/app/configs/docker/` (read-only), and the service reads the file with all `${VAR}` placeholders replaced by the corresponding environment variable from `.env`.
+The image bakes its own copy of `configs/docker/*.yaml` in at `/app/configs/docker/` (see the
+`Dockerfile`), so a plain `docker compose up -d` from Step 1 works with no YAML files on your host at
+all. The service reads whichever copy is present with all `${VAR}` placeholders replaced by the
+corresponding environment variable from `.env`.
 
 **When to modify YAML configs:**
 
 - **Rarely.** Most production customization is done via `.env`.
 - **Advanced use cases**: Custom logging formats, extended health check intervals, performance tuning, or adding experimental features.
 - **After modification**: Restart the affected container: `docker compose restart telesrv-core`.
+
+#### Advanced: overriding baked-in configs
+
+`docker-compose-development.yml` (used when you have the full repo checked out, see [Section 7](#7-development-workflow))
+bind-mounts `./configs/docker:/app/configs/docker:ro` so local edits apply on restart without rebuilding
+the image. The production `docker-compose.yml` intentionally does **not** mount that path, so the
+image's baked-in defaults are what actually ship — mounting your own `./configs/docker` over a bare
+`docker-compose.yml` deployment (no repo checkout) would need you to first populate that directory with
+complete YAML files yourself (e.g. copied out of the image with `docker run --rm --entrypoint cat
+ghcr.io/roon9e/gramsrv:latest /app/configs/docker/core.yaml > configs/docker/core.yaml`, repeated per
+service), then add the same `volumes:` line back to a `docker-compose.override.yml`.
+
+Similarly, the optional `postgres-init/010_branch_databases.sql` script only matters if you're sharing
+one Postgres container between the `main` and `v2` branches (it just pre-creates the `telesrv_main`/
+`telesrv_v2` databases those branches use instead of the default `telesrv` database this branch actually
+connects to via `TELESRV_POSTGRES_DSN`). A normal single-branch `v2` deployment doesn't need it: fetch it
+only if that scenario applies to you —
+```bash
+mkdir -p postgres-init
+curl -sSL -o postgres-init/010_branch_databases.sql https://raw.githubusercontent.com/roon9e/gramsrv/v2/postgres-init/010_branch_databases.sql
+```
+and mount it the same way `docker-compose-development.yml` does (`./postgres-init:/docker-entrypoint-initdb.d:ro`
+on the `postgres` service) before the *first* `docker compose up` (Postgres only runs
+`docker-entrypoint-initdb.d` scripts against a brand-new, empty data volume).
 
 ### Identity migration
 
@@ -358,20 +360,25 @@ tar -czf backup-data-$(date +%Y%m%d).tar.gz data/
 
 ### Services fail to start: "config file not found"
 
-**Cause:** Missing `configs/docker/` directory or incomplete file downloads.
+**Cause:** `configs/docker/*.yaml` is baked into the image (see [Section 2](#microservice-yaml-configs)),
+so this almost always means either an old/custom image that predates the bake-in, or a
+`docker-compose.override.yml` (or an inherited `docker-compose-development.yml` habit) that mounts a
+`./configs/docker` host directory over the image's copy without that directory actually having the
+files in it.
 
 **Solution:**
 ```bash
-# Re-run Step 1b to download all config files
-for file in admin.yaml core.yaml edge.yaml egress.yaml file.yaml sfu.yaml ton.yaml; do \
-  curl -sSL -o "configs/docker/${file}" "https://raw.githubusercontent.com/roon9e/gramsrv/v2/configs/docker/${file}"; \
-done
+# Confirm the image actually has the configs baked in
+docker compose run --rm --entrypoint ls telesrv-core /app/configs/docker/
+# Should list: admin.yaml core.yaml edge.yaml egress.yaml file.yaml sfu.yaml ton.yaml
 
-# Verify files exist
+# If you intentionally have a configs/docker bind mount (see "Advanced: overriding
+# baked-in configs" in Section 2), make sure it's fully populated, not partial:
 ls -la configs/docker/
 
-# Restart services
-docker compose restart
+# Pull the latest image if yours predates the bake-in, then recreate:
+docker compose pull
+docker compose up -d --force-recreate
 ```
 
 ### Services fail with "invalid token" or "authentication failed"

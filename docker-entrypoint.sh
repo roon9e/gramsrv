@@ -102,8 +102,31 @@ case "$cmd_name" in
 esac
 
 case "$cmd_name" in
+  telesrv-core)
+    # The Admin API server itself runs inside telesrv-core (adminapi.Start,
+    # addr :2599); telesrv-admin is only the client authenticating to it with
+    # this same token. adminapi.Start already refuses to start on an empty
+    # token, but that surfaces as a buried Go error deep in core's boot log --
+    # fail fast here with the same clear message as the other secrets.
+    validate_secret "TELESRV_ADMIN_API_TOKEN" "$TELESRV_ADMIN_API_TOKEN"
+    ;;
+esac
+
+case "$cmd_name" in
   telesrv-edge|telesrv-egress)
     validate_secret "TELESRV_EGRESS_ACK_TOKEN" "$TELESRV_EGRESS_ACK_TOKEN"
+    ;;
+esac
+
+case "$cmd_name" in
+  telesrv-admin)
+    # internal/config/admin_config.go already refuses to build the config
+    # (fatal Go error) if UI password/token are both empty or session_key is
+    # empty. Fail fast here instead, with the same clear message as every
+    # other secret, rather than a buried config-parse error.
+    validate_secret "TELESRV_ADMIN_UI_PASSWORD" "$TELESRV_ADMIN_UI_PASSWORD"
+    validate_secret "TELESRV_ADMIN_SESSION_KEY" "$TELESRV_ADMIN_SESSION_KEY"
+    validate_secret "TELESRV_ADMIN_API_TOKEN" "$TELESRV_ADMIN_API_TOKEN"
     ;;
 esac
 

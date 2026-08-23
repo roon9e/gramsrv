@@ -52,6 +52,14 @@ COPY --from=builder /out/* /usr/local/bin/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# Bake the per-service YAML configs into the image so a bare `docker-compose.yml`
+# + `.env` deployment (no repo checkout) works without separately curling each
+# file from GitHub. docker-compose-development.yml still bind-mounts
+# ./configs/docker over this path so local edits apply without a rebuild;
+# the production docker-compose.yml intentionally does not, so this baked-in
+# copy is what actually ships.
+COPY configs/docker /app/configs/docker
+
 # Default working directories for persistent state and configs
 RUN mkdir -p /app/data /app/configs
 
