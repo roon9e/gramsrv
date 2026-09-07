@@ -70,7 +70,7 @@ func TestLoadBuildsPostgresDSNFromPassword(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	want := "postgres://telesrv:p%40ss%3Aword%2Fwith%3Freserved%23chars@127.0.0.1:5432/telesrv?sslmode=disable"
+	want := "postgres://telesrv:p%40ss%3Aword%2Fwith%3Freserved%23chars@127.0.0.1:5432/telesrv_main?sslmode=disable"
 	if cfg.PostgresDSN != want {
 		t.Fatalf("PostgresDSN = %q, want %q", cfg.PostgresDSN, want)
 	}

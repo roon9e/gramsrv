@@ -1990,7 +1990,7 @@ func postgresDSN(e envSource) string {
 		Scheme: "postgres",
 		User:   url.UserPassword("telesrv", e.envOr("TELESRV_POSTGRES_PASSWORD", "telesrv")),
 		Host:   "127.0.0.1:5432",
-		Path:   "/telesrv",
+		Path:   "/telesrv_main",
 	}
 	query := u.Query()
 	query.Set("sslmode", "disable")
