@@ -50,6 +50,25 @@ The development compose file exposes Postgres on `127.0.0.1:5432` and Redis on
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
+The legacy development stack uses `telesrv` as the default password for both
+services. Set `TELESRV_POSTGRES_PASSWORD` and `TELESRV_REDIS_PASSWORD` in `.env`
+when changing them; the server derives its local Postgres DSN from the former
+unless `TELESRV_POSTGRES_DSN` is explicitly set.
+
+To rotate the Postgres password on an existing volume, first change
+`TELESRV_POSTGRES_PASSWORD` in `.env`, then change the role password while the
+old password is still available:
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d postgres
+docker exec -e PGPASSWORD="$OLD_POSTGRES_PASSWORD" telesrv-postgres \
+  psql -U telesrv -d postgres -v password="$TELESRV_POSTGRES_PASSWORD" \
+  -c "ALTER ROLE telesrv PASSWORD :'password'"
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+Do not use `down -v` for a password rotation; that deletes the database.
+
 If you use external Postgres or Redis, update `TELESRV_POSTGRES_DSN` and
 `TELESRV_REDIS_ADDR` in `.env`.
 

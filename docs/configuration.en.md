@@ -439,7 +439,8 @@ key rings independently on different instances.
 
 | Setting | Type / code default | Description and constraints |
 |---|---|---|
-| `TELESRV_POSTGRES_DSN` | secret DSN / `postgres://telesrv:telesrv@127.0.0.1:5432/telesrv_main?sslmode=disable` | Primary durable business database. Local `main` and `v2` use separate `telesrv_main` / `telesrv_v2` databases because their migration histories differ. Production must replace the development credentials and TLS policy. |
+| `TELESRV_POSTGRES_DSN` | optional secret DSN | Explicit primary durable business database connection. When empty, local development derives a DSN from `TELESRV_POSTGRES_PASSWORD`; production should set this explicitly with its TLS policy. |
+| `TELESRV_POSTGRES_PASSWORD` | secret string / `telesrv` | Password used by the legacy development Compose Postgres container and by the derived local DSN. Changing it does not change an existing PostgreSQL role; follow the rotation procedure in `docs/local-setup.md`. |
 | `TELESRV_POSTGRES_MAX_CONNS` | int / `50` | Maximum connections for one pgxpool. `<=0` delegates to pgx defaults. New backends are also fenced by server-wide advisory admission on the PostgreSQL instance, so per-process maxima are not additive static budgets. |
 | `TELESRV_POSTGRES_MIN_CONNS` | int / `16` | pgxpool pre-warmed minimum. The minimum is retained; burst connections above it return their global admission slots after five idle seconds. |
 | `TELESRV_REDIS_ADDR` | address / `127.0.0.1:6399` | Redis used for volatile codes, limits, and shared update/cache state. |

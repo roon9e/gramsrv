@@ -5,7 +5,7 @@
 #   关停：  docker compose down          （保留数据卷）
 #   清空：  docker compose down -v        （连数据卷一起删，重置 schema/数据）
 #
-# main / v2 分别使用 telesrv_main / telesrv_v2；legacy telesrv 库只保留兼容和人工迁移。
+# This development deployment uses the legacy-compatible telesrv database.
 # server 端连接串见各分支 internal/config/config.go 的默认值（localhost:5432 / localhost:6399）。
 name: telesrv
 
@@ -30,7 +30,7 @@ services:
     environment:
       POSTGRES_DB: telesrv
       POSTGRES_USER: telesrv
-      POSTGRES_PASSWORD: telesrv
+      POSTGRES_PASSWORD: ${TELESRV_POSTGRES_PASSWORD:-telesrv}
       TZ: UTC
     ports:
       - "5432:5432"
@@ -47,13 +47,18 @@ services:
   redis:
     image: redis:7-alpine
     container_name: telesrv-redis
-    command: ["redis-server", "--appendonly", "yes"]
+    environment:
+      REDIS_PASSWORD: ${TELESRV_REDIS_PASSWORD:-telesrv}
+    command:
+      - sh
+      - -c
+      - exec redis-server --appendonly yes --requirepass "$${REDIS_PASSWORD}"
     ports:
       - "6399:6379"   # 宿主 6379 常被其他项目占用，telesrv 对外用 6399（容器内仍 6379）
     volumes:
       - redisdata:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -qx PONG"]
       interval: 5s
       timeout: 3s
       retries: 10

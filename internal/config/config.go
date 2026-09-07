@@ -877,8 +877,8 @@ func Load() (Config, error) {
 		// 用 127.0.0.1 而非 localhost：localhost 在 Windows 上会先解析到 IPv6 ::1，而 Docker
 		// Desktop 的端口转发只在 IPv4 监听，IPv6 连接要等 ~1s 超时才回退 IPv4（实测 localhost
 		// 建连 1.0s vs 127.0.0.1 6ms）。冷连接洪峰下池扩容的新连接各等 1s → pre-handler 惊群卡顿。
-		// 生产由 TELESRV_POSTGRES_DSN 覆盖；该默认值仅作用于本地开发。
-		PostgresDSN:      envOr("TELESRV_POSTGRES_DSN", "postgres://telesrv:telesrv@127.0.0.1:5432/telesrv_main?sslmode=disable"),
+		// 生产由 TELESRV_POSTGRES_DSN 覆盖；本地开发从密码变量组装 DSN。
+		PostgresDSN:      postgresDSN(fileEnv),
 		PostgresMaxConns: envIntOr("TELESRV_POSTGRES_MAX_CONNS", 50),
 		PostgresMinConns: envIntOr("TELESRV_POSTGRES_MIN_CONNS", 16),
 		RedisAddr:        envOr("TELESRV_REDIS_ADDR", "127.0.0.1:6399"), // 同理避开 localhost→IPv6 回退延迟
@@ -1980,6 +1980,22 @@ func (e envSource) envAllowEmptyOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func postgresDSN(e envSource) string {
+	if dsn := e.envOr("TELESRV_POSTGRES_DSN", ""); dsn != "" {
+		return dsn
+	}
+	u := url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword("telesrv", e.envOr("TELESRV_POSTGRES_PASSWORD", "telesrv")),
+		Host:   "127.0.0.1:5432",
+		Path:   "/telesrv",
+	}
+	query := u.Query()
+	query.Set("sslmode", "disable")
+	u.RawQuery = query.Encode()
+	return u.String()
 }
 
 func (e envSource) envListOr(key string, def []string) []string {
