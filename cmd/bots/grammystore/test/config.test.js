@@ -5,7 +5,8 @@ import { loadConfig } from "../src/config.js";
 const managedEnv = [
   "BOT_TOKEN", "OWNER_IDS", "GRAMSRV_TOKEN", "CODE_WEBHOOK_SECRET",
   "DEFAULT_LANGUAGE", "DEFAULT_NUMBER_COUNTRY", "REFERRAL_BONUS",
-  "DAILY_BONUS", "NOTIFICATION_TTL_DAYS", "DATABASE_URL", "BOT_MODE",
+  "DAILY_BONUS", "NOTIFICATION_TTL_DAYS", "DATABASE_URL", "DATABASE_HOST",
+  "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB", "BOT_MODE",
 ];
 
 function withEnv(values, fn) {
@@ -54,11 +55,25 @@ test("loadConfig rejects placeholder values", () => {
   }
 });
 
-test("loadConfig requires DATABASE_URL", () => {
+test("loadConfig builds an encoded database URL from Compose settings", () => {
+  const config = withEnv({
+    BOT_TOKEN: "999:TEST", OWNER_IDS: "1", GRAMSRV_TOKEN: "token",
+    CODE_WEBHOOK_SECRET: "abcdefghijklmnopqrstuvwxyz", DATABASE_HOST: "postgres",
+    POSTGRES_USER: "grammystore", POSTGRES_PASSWORD: "p@ss:word/with?reserved#chars%literal",
+    POSTGRES_DB: "grammystore",
+  }, () => loadConfig());
+  const parsed = new URL(config.dbUrl);
+  assert.equal(parsed.hostname, "postgres");
+  assert.equal(decodeURIComponent(parsed.username), "grammystore");
+  assert.equal(decodeURIComponent(parsed.password), "p@ss:word/with?reserved#chars%literal");
+  assert.equal(parsed.pathname, "/grammystore");
+});
+
+test("loadConfig requires database settings", () => {
   assert.throws(() => withEnv({
     BOT_TOKEN: "999:TEST", OWNER_IDS: "1", GRAMSRV_TOKEN: "token",
     CODE_WEBHOOK_SECRET: "abcdefghijklmnopqrstuvwxyz",
-  }, () => loadConfig()), /DATABASE_URL is required/);
+  }, () => loadConfig()), /POSTGRES_USER is required/);
 });
 
 test("loadConfig requires CODE_WEBHOOK_SECRET with minimum length", () => {

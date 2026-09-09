@@ -33,6 +33,17 @@ function botMode() {
   return raw;
 }
 
+function databaseURL() {
+  const configured = (process.env.DATABASE_URL ?? "").trim();
+  if (configured) return configured;
+
+  const host = (process.env.DATABASE_HOST ?? "localhost").trim();
+  const user = encodeURIComponent(required("POSTGRES_USER"));
+  const password = encodeURIComponent(required("POSTGRES_PASSWORD"));
+  const database = encodeURIComponent(required("POSTGRES_DB"));
+  return `postgresql://${user}:${password}@${host}:5432/${database}`;
+}
+
 export function loadConfig() {
   const webhookSecret = required("CODE_WEBHOOK_SECRET");
   if (webhookSecret.length < 24) throw new Error("CODE_WEBHOOK_SECRET must contain at least 24 characters");
@@ -50,7 +61,7 @@ export function loadConfig() {
     gramsrvToken: required("GRAMSRV_TOKEN"),
     gramsrvActor: (process.env.GRAMSRV_ACTOR ?? "grammystore").trim(),
     publicBaseURL: (process.env.PUBLIC_BASE_URL ?? "https://example.com").replace(/\/+$/, ""),
-    dbUrl: required("DATABASE_URL"),
+    dbUrl: databaseURL(),
     botMode: mode,
     codeHost: (process.env.CODE_HTTP_HOST ?? "0.0.0.0").trim(),
     codePort: integer("CODE_HTTP_PORT", 2800, { min: 1 }),

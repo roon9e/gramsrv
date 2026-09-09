@@ -25,7 +25,7 @@ services:
     env_file:
       - .env
     environment:
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@grammystore_postgres:5432/${POSTGRES_DB}
+      - DATABASE_HOST=grammystore_postgres
     networks:
       - grammynet
     ports:
