@@ -980,6 +980,15 @@ func (w StarGiftCatalogWrite) ValidateLifecycleAuthoring(now int) error {
 // AvailabilityRemains seeds the client's "N left" projection; auction settlement
 // keeps it in step with gifts_left afterwards.
 func (w *StarGiftCatalogWrite) NormalizeLifecycleAuthoring(now int) {
+	// A finite availability makes the gift limited-edition regardless of auction
+	// mode: "limited AND availability_total > 0" is the one supply CHECK a limited
+	// gift must satisfy, so availability_total > 0 alone flips the flag.
+	if w.AvailabilityTotal > 0 {
+		w.Limited = true
+		if w.AvailabilityRemains <= 0 {
+			w.AvailabilityRemains = w.AvailabilityTotal
+		}
+	}
 	if !w.Auction {
 		return
 	}

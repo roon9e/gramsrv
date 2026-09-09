@@ -3697,12 +3697,19 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 	// the supply check then requires availability_total > 0. Leaving both zero made
 	// every official auction import fail on the INSERT. Carry the snapshot's supply
 	// for that case only, and let the shared normalizer derive the rest.
-	auctionLimited, auctionTotal := false, 0
+	limited, availabilityTotal := false, 0
 	if bundle.Gift.Auction {
-		auctionLimited, auctionTotal = true, bundle.Gift.AvailabilityTotal
-		if auctionTotal <= 0 {
-			auctionTotal = req.SupplyTotal
+		limited, availabilityTotal = true, bundle.Gift.AvailabilityTotal
+		if availabilityTotal <= 0 {
+			availabilityTotal = req.SupplyTotal
 		}
+	}
+	// The operator's "Уникальный тираж" (supply_total) also limits the base gift:
+	// a finite unique supply is published as the same-size limited-edition run of
+	// purchasable copies. NormalizeLifecycleAuthoring then flips Limited and seeds
+	// availability_remains for the one supply CHECK both facts must satisfy.
+	if req.SupplyTotal > 0 && !limited {
+		limited, availabilityTotal = true, req.SupplyTotal
 	}
 
 	baseAnimation, err := s.gifts.PrepareOfficialAnimation(bundle.BaseDocument.FileName, bundle.BaseDocument.Data)
@@ -3792,11 +3799,11 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 		// inventory. Keep the complete source JSON as provenance, while publishing
 		// regular official imports as a fresh, locally purchasable catalog entry.
 		// Local resale counters and sale dates are derived by lifecycle writes.
-		// Auctions are the one exception; see auctionLimited above.
-		Limited: auctionLimited, SoldOut: false, Birthday: bundle.Gift.Birthday,
+		// Auctions are the one exception; see limited above.
+		Limited: limited, SoldOut: false, Birthday: bundle.Gift.Birthday,
 		RequirePremium: bundle.Gift.RequirePremium, LimitedPerUser: bundle.Gift.LimitedPerUser,
 		PeerColorAvailable: bundle.Gift.PeerColorAvailable, Auction: bundle.Gift.Auction,
-		AvailabilityRemains: 0, AvailabilityTotal: auctionTotal,
+		AvailabilityRemains: 0, AvailabilityTotal: availabilityTotal,
 		AvailabilityResale: 0, FirstSaleDate: 0,
 		LastSaleDate: 0, ResellMinStars: 0,
 		PerUserTotal: bundle.Gift.PerUserTotal, LockedUntilDate: lockedUntilDate,
@@ -3829,6 +3836,11 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 		if write.Catalog.Auction {
 			details["auction_availability_total"] = write.Catalog.AvailabilityTotal
 			details["auction_start_date"] = write.Catalog.AuctionStartDate
+		}
+		if write.Catalog.Limited {
+			details["limited"] = write.Catalog.Limited
+			details["availability_total"] = write.Catalog.AvailabilityTotal
+			details["availability_remains"] = write.Catalog.AvailabilityRemains
 		}
 		if bundle.Collectible != nil {
 			details["models"] = len(bundle.Collectible.Models)
