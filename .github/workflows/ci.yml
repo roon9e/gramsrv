@@ -71,6 +71,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: grammystore_test
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test_user -d grammystore_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -92,6 +107,12 @@ jobs:
 
       - name: Test
         working-directory: cmd/bots/grammystore
+        env:
+          DATABASE_URL: postgres://test_user:test_password@localhost:5432/grammystore_test
+          BOT_TOKEN: "999:TEST"
+          OWNER_IDS: "1"
+          GRAMSRV_TOKEN: "test-token"
+          CODE_WEBHOOK_SECRET: "abcdefghijklmnopqrstuvwxyz1234"
         run: npm test
 
   docker-smoke:

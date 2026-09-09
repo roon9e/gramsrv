@@ -5,18 +5,15 @@ import { GramsrvClient } from "./gramsrv.js";
 import { commandList, createBot } from "./bot.js";
 import { normalizeLanguage, translate } from "./i18n.js";
 import { parseTelesrvDelivery, verifyTelesrvSignature } from "./otp.js";
+import { isRealMode } from "./real-number.js";
 
 const config = loadConfig();
-const db = new BotDatabase(config.dbPath);
+const db = new BotDatabase(config.dbUrl);
 const gramsrv = new GramsrvClient(config);
 const bot = createBot({ config, db, gramsrv });
 
 function escapeHTML(value) { return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"); }
 function json(response, status, body) { response.writeHead(status, { "content-type": "application/json; charset=utf-8" }); response.end(JSON.stringify(body)); }
-
-function languageByChatID(chatID) {
-  return normalizeLanguage(db.userByChatID(chatID)?.language, config.defaultLanguage);
-}
 
 function loginCodeMessage(language, recipient, code, unbound = false) {
   const variables = {
@@ -40,13 +37,14 @@ async function deliverLoginCode(recipient, code, chatIDs) {
   let delivered = 0;
   for (const chatID of chatIDs) {
     try {
-      await bot.api.sendMessage(chatID, loginCodeMessage(languageByChatID(chatID), recipient, code), { parse_mode: "HTML" });
+      const userLang = normalizeLanguage(db._userCache?.get(0)?.language, config.defaultLanguage);
+      await bot.api.sendMessage(chatID, loginCodeMessage(userLang, recipient, code), { parse_mode: "HTML" });
       delivered++;
     }
     catch (error) { console.error("OTP delivery failed", chatID, error); }
   }
   if (!delivered) for (const owner of config.ownerIDs) {
-    await bot.api.sendMessage(owner, loginCodeMessage(languageByChatID(owner), recipient, code, true), { parse_mode: "HTML" }).catch(() => {});
+    await bot.api.sendMessage(owner, loginCodeMessage(config.defaultLanguage, recipient, code, true), { parse_mode: "HTML" }).catch(() => {});
   }
 }
 
@@ -61,15 +59,17 @@ const server = http.createServer((request, response) => {
       const raw = Buffer.concat(chunks);
       if (!verifyTelesrvSignature(config.codeWebhookSecret, request.headers, raw)) return json(response, 401, { accepted: false, error_code: "SIGNATURE_INVALID", retryable: false });
       const { recipient, code, deliveryID, expiresAt, fingerprint } = parseTelesrvDelivery(raw, request.headers);
-      const delivery = db.acceptLoginCodeDelivery(deliveryID, fingerprint, recipient, code, expiresAt);
-      // Authentication must not depend on Telegram Bot API latency. Persist the
-      // code, acknowledge gramsrv immediately, then fan it out asynchronously.
-      json(response, 202, { accepted: true, message_id: `grammy:${deliveryID}` });
-      if (!delivery.duplicate) void deliverLoginCode(recipient, code, delivery.chatIDs).catch((error) => console.error("OTP dispatch failed", error));
+      db.acceptLoginCodeDelivery(deliveryID, fingerprint, recipient, code, expiresAt).then((delivery) => {
+        json(response, 202, { accepted: true, message_id: `grammy:${deliveryID}` });
+        if (!delivery.duplicate) void deliverLoginCode(recipient, code, delivery.chatIDs).catch((error) => console.error("OTP dispatch failed", error));
+      }).catch((error) => {
+        console.error("OTP webhook failed", error);
+        const conflict = error.message === "IDEMPOTENCY_CONFLICT";
+        json(response, conflict ? 409 : 400, { accepted: false, error_code: conflict ? "IDEMPOTENCY_CONFLICT" : "JSON_INVALID", retryable: false });
+      });
     } catch (error) {
       console.error("OTP webhook failed", error);
-      const conflict = error.message === "IDEMPOTENCY_CONFLICT";
-      return json(response, conflict ? 409 : 400, { accepted: false, error_code: conflict ? "IDEMPOTENCY_CONFLICT" : "JSON_INVALID", retryable: false });
+      json(response, 400, { accepted: false, error_code: "JSON_INVALID", retryable: false });
     }
   });
 });
@@ -79,6 +79,7 @@ server.listen(config.codePort, config.codeHost, () => console.log(`OTP webhook l
 const me = await bot.api.getMe();
 bot.botInfo = me;
 console.log(`Starting @${me.username}`);
+console.log(`Bot mode: ${config.botMode}`);
 await bot.api.setMyCommands(commandList(config.defaultLanguage));
 await bot.api.setMyCommands(commandList("ru"), { language_code: "ru" });
 await bot.api.setMyCommands(commandList("en"), { language_code: "en" });
@@ -86,7 +87,7 @@ await bot.api.setMyCommands(commandList("en"), { language_code: "en" });
 let stopping = false;
 async function shutdown(signal) {
   if (stopping) return; stopping = true; console.log(`Stopping on ${signal}`);
-  bot.stop(); server.close(); db.close();
+  bot.stop(); server.close(); await db.close();
 }
 process.once("SIGINT", () => shutdown("SIGINT"));
 process.once("SIGTERM", () => shutdown("SIGTERM"));

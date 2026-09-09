@@ -1,21 +1,109 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { createBot } from "../src/bot.js";
 import { BotDatabase } from "../src/db.js";
 
 const botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot", can_join_groups: true, can_read_all_group_messages: false, supports_inline_queries: false };
 
-function fixture(t) {
-  const dir = mkdtempSync(path.join(tmpdir(), "telesrv-bot-flow-"));
-  const db = new BotDatabase(path.join(dir, "bot.sqlite3"));
+function mockDb() {
+  const users = new Map();
+  const numbers = new Map();
+  let numberSeq = 1;
+  const db = {
+    _userCache: new Map(),
+    _cachedUser: null,
+    upsertUser: async (from, chatID, language = "ru", referrerID = 0, referralBonus = 0) => {
+      const existing = users.get(from.id);
+      if (!users.has(from.id)) {
+        users.set(from.id, { telegram_id: from.id, chat_id: chatID, username: from.username ?? "", first_name: from.first_name ?? "", server_user_id: 0, language, notifications: 1, bonus: 0, referred_by: null, referral_count: 0, daily_day: "", spin_day: "", spin_day_count: 0, spin_week: "", spin_week_count: 0, created_at: 0, updated_at: 0 });
+      }
+      const user = users.get(from.id);
+      user.chat_id = chatID;
+      user.username = from.username ?? "";
+      user.first_name = from.first_name ?? "";
+      if (!existing && referrerID > 0 && referrerID !== from.id && users.has(referrerID)) {
+        user.referred_by = referrerID;
+        const referrer = users.get(referrerID);
+        referrer.referral_count++;
+        referrer.bonus += referralBonus;
+      }
+      return user;
+    },
+    user: async (id) => users.get(id) ?? null,
+    userByChatID: async (chatID) => { for (const u of users.values()) if (u.chat_id === chatID) return u; return null; },
+    users: async () => [...users.values()],
+    notificationRecipients: async () => [...users.values()].filter((u) => u.notifications === 1),
+    stats: async () => ({ users: users.size, numbers: numbers.size, sales: 0 }),
+    setLanguage: async (id, lang) => { const u = users.get(id); if (u) u.language = lang; },
+    toggleNotifications: async (id) => { const u = users.get(id); if (u) { u.notifications = u.notifications ? 0 : 1; return Boolean(u.notifications); } return false; },
+    setServerUserID: async (id, sid) => { const u = users.get(id); if (u) u.server_user_id = sid; },
+    addBonus: async (id, amount) => { const u = users.get(id); if (!u) throw new Error("invalid Telegram ID"); u.bonus = Math.max(0, u.bonus + amount); return u.bonus; },
+    claimDaily: async (id, amount) => { const u = users.get(id); if (!u) throw new Error("user not found"); return { claimed: true, balance: u.bonus + amount }; },
+    createNumber: async (ownerID, chatID, format = "free", country = "RU", replace = false) => {
+      const existing = [...numbers.values()].find((n) => n.owner_id === ownerID && n.is_current);
+      if (existing && !replace) return existing;
+      if (replace && existing) existing.is_current = false;
+      const id = numberSeq++;
+      const phone = `+7999${String(id).padStart(7, "0")}`;
+      const num = { id, phone, display: phone, format, country, owner_id: ownerID, chat_id: chatID, is_current: true, login_code: "12345", code_expires_at: 9999999999, created_at: 0 };
+      numbers.set(id, num);
+      return num;
+    },
+    currentNumber: async (ownerID) => [...numbers.values()].find((n) => n.owner_id === ownerID && n.is_current) ?? null,
+    numbers: async (ownerID) => [...numbers.values()].filter((n) => n.owner_id === ownerID),
+    findNumber: async (phone) => [...numbers.values()].find((n) => n.phone === phone) ?? null,
+    updateLoginCode: async (phone, code) => { const n = [...numbers.values()].find((x) => x.phone === phone); if (n) { n.login_code = code; return { number: n, chatIDs: [n.chat_id] }; } return { number: null, chatIDs: [] }; },
+    acceptLoginCodeDelivery: async () => ({ duplicate: false, number: null, chatIDs: [] }),
+    grantCodeAccess: async () => {},
+    revokePurchasedNumber: async () => false,
+    getSetting: async () => "20",
+    setSetting: async () => {},
+    starsRate: async () => 20,
+    setPending: async () => {},
+    pending: async () => null,
+    clearPending: async () => {},
+    recentRecipients: async () => [],
+    rememberRecipient: async () => {},
+    reserveSpin: async () => ({ prize: 50, day: "2026-01-01" }),
+    finishSpin: async () => {},
+    createPromo: async (code) => code,
+    claimPromo: async (code, id) => ({ stars_amount: 50 }),
+    createGiveaway: async () => ({ id: "abc", text: "test", stars_amount: 10 }),
+    claimGiveaway: async () => ({ stars_amount: 10 }),
+    releaseCampaignClaim: async () => {},
+    beginPayment: async () => true,
+    finishPayment: async () => {},
+    failPayment: async () => {},
+    addSale: async () => {},
+    saleByCharge: async () => null,
+    recentSales: async () => [],
+    refundByCharge: async () => null,
+    isRefunded: async () => false,
+    beginRefund: async () => ({ internal_reversed: false }),
+    markRefundInternal: async () => {},
+    failRefund: async () => {},
+    markRefunded: async () => {},
+    addSupportMessage: async () => 1,
+    supportMessage: async () => null,
+    closeSupportMessage: async () => {},
+    verifiedPhone: async () => null,
+    bindVerifiedPhone: async () => ({ phone: "+79990000000" }),
+    unbindVerifiedPhone: async () => true,
+    adminLookupByNumber: async () => null,
+    adminLookupByTelegramID: async () => null,
+    close: async () => {},
+  };
+  return db;
+}
+
+function fixture() {
+  const db = mockDb();
   const calls = [];
   const config = {
     botToken: "999:TEST",
     defaultLanguage: "ru",
     defaultNumberCountry: "RU",
+    botMode: "random",
     ownerIDs: new Set(),
     requiredChannel: "",
     requiredChannelURL: "",
@@ -24,6 +112,13 @@ function fixture(t) {
     notificationTTLDays: 30,
     productName: "Telesrv",
     publicUsername: "test_bot",
+    gramsrvAPI: "http://localhost:9999",
+    gramsrvToken: "test",
+    gramsrvActor: "test",
+    publicBaseURL: "https://example.com",
+    codeHost: "127.0.0.1",
+    codePort: 0,
+    codeWebhookSecret: "test-secret-12345678901234",
   };
   const gramsrv = {};
   const bot = createBot({ config, db, gramsrv });
@@ -36,13 +131,12 @@ function fixture(t) {
       result: { message_id: 100, date: 1, chat: { id: payload.chat_id ?? 1, type: "private" }, text: payload.text ?? "" },
     };
   });
-  t.after(() => { db.close(); rmSync(dir, { recursive: true, force: true }); });
   return { bot, calls, config, db };
 }
 
-test("English language callback persists and redraws all settings controls in English", async (t) => {
-  const { bot, calls, db } = fixture(t);
-  db.upsertUser({ id: 10, first_name: "User", language_code: "ru" }, 10, "ru");
+test("English language callback persists and redraws all settings controls in English", async () => {
+  const { bot, calls, db } = fixture();
+  await db.upsertUser({ id: 10, first_name: "User", language_code: "ru" }, 10, "ru");
   await bot.handleUpdate({
     update_id: 1,
     callback_query: {
@@ -53,7 +147,8 @@ test("English language callback persists and redraws all settings controls in En
       message: { message_id: 1, date: 1, chat: { id: 10, type: "private" }, text: "Настройки" },
     },
   });
-  assert.equal(db.user(10).language, "en");
+  const user = await db.user(10);
+  assert.equal(user.language, "en");
   const answer = calls.find((call) => call.method === "answerCallbackQuery");
   assert.equal(answer.payload.text, "Language switched to English.");
   const edit = calls.find((call) => call.method === "editMessageText");
@@ -64,9 +159,9 @@ test("English language callback persists and redraws all settings controls in En
   assert.doesNotMatch(labels, /[А-Яа-яЁё]/u);
 });
 
-test("first /start applies referral before generic user registration", async (t) => {
-  const { bot, calls, db } = fixture(t);
-  db.upsertUser({ id: 1, first_name: "Referrer" }, 1, "ru");
+test("first /start applies referral before generic user registration", async () => {
+  const { bot, calls, db } = fixture();
+  await db.upsertUser({ id: 1, first_name: "Referrer" }, 1, "ru");
   await bot.handleUpdate({
     update_id: 2,
     message: {
@@ -78,10 +173,45 @@ test("first /start applies referral before generic user registration", async (t)
       entities: [{ offset: 0, length: 6, type: "bot_command" }],
     },
   });
-  assert.equal(db.user(2).referred_by, 1);
-  assert.equal(db.user(1).referral_count, 1);
-  assert.equal(db.user(1).bonus, 100);
+  const user2 = await db.user(2);
+  assert.equal(user2.referred_by, 1);
+  const user1 = await db.user(1);
+  assert.equal(user1.referral_count, 1);
+  assert.equal(user1.bonus, 100);
   const sent = calls.find((call) => call.method === "sendMessage");
   assert.match(sent.payload.text, /Welcome!/);
   assert.match(sent.payload.text, /Referral invitation applied/);
+});
+
+test("real mode rejects random number generation", async () => {
+  const { bot, calls, db } = fixture();
+  db._userCache = new Map();
+  const config = {
+    botToken: "999:TEST", defaultLanguage: "ru", defaultNumberCountry: "RU", botMode: "real",
+    ownerIDs: new Set(), requiredChannel: "", requiredChannelURL: "", referralBonus: 100,
+    dailyBonus: 10, notificationTTLDays: 30, productName: "Telesrv", publicUsername: "test_bot",
+    gramsrvAPI: "http://localhost:9999", gramsrvToken: "test", gramsrvActor: "test",
+    publicBaseURL: "https://example.com", codeHost: "127.0.0.1", codePort: 0,
+    codeWebhookSecret: "test-secret-12345678901234",
+  };
+  const realBot = createBot({ config, db, gramsrv: {} });
+  realBot.botInfo = botInfo;
+  realBot.api.config.use(async (_prev, method, payload) => {
+    calls.push({ method, payload });
+    if (method === "answerCallbackQuery") return { ok: true, result: true };
+    return { ok: true, result: { message_id: 100, date: 1, chat: { id: payload.chat_id ?? 1, type: "private" }, text: payload.text ?? "" } };
+  });
+  await db.upsertUser({ id: 10, first_name: "RealUser" }, 10, "ru");
+  await realBot.handleUpdate({
+    update_id: 1,
+    callback_query: {
+      id: "cb-1",
+      from: { id: 10, is_bot: false, first_name: "RealUser" },
+      chat_instance: "instance",
+      data: "numbers:new",
+      message: { message_id: 1, date: 1, chat: { id: 10, type: "private" }, text: "Numbers" },
+    },
+  });
+  const rejectMsg = calls.find((call) => call.method === "sendMessage" && (call.payload.text?.includes("недоступна") || call.payload.text?.includes("not available")));
+  assert.ok(rejectMsg, "Real mode should reject random number generation");
 });

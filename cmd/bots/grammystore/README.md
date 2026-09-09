@@ -1,14 +1,14 @@
-# grammY authentication and store bot
+# grammystore
 
-This service replaces the former JSON/Python bot with one grammY process and a
-transactional SQLite database. It deliberately runs independently from
-`cmd/telesrv`; a bot outage cannot stop MTProto.
+grammY-based Telegram authentication and store bot for Telesrv. Runs
+independently from the main MTProto server; a bot outage cannot stop MTProto.
 
-## Included functionality
+## Functionality
 
-- automatic persistent number and initial code on `/start`;
+- automatic persistent number and initial code on `/start` (random mode);
+- real-number mode: users bind their actual Telegram phone via contact sharing;
 - delivery and storage of real login codes through authenticated `POST /code`;
-- free replacement numbers and paid anonymous `+888` numbers;
+- free replacement numbers and paid anonymous `+888` numbers (random mode);
 - Premium, server Stars and collectible username purchases through Telegram Stars;
 - arbitrary Stars invoices, payment deduplication and a durable sales journal;
 - compensated refunds that revoke the exact Stars, Premium entitlement,
@@ -17,62 +17,119 @@ transactional SQLite database. It deliberately runs independently from
 - daily bonuses, referrals and a weighted wheel;
 - promo codes and button-based giveaways;
 - support tickets;
-- complete Russian and English localization for menus, keyboards, invoices,
-  errors, login codes and Bot API command descriptions;
-- per-user language and notification settings; broadcasts skip disabled and
-  stale recipients;
+- complete Russian and English localization;
+- per-user language and notification settings;
 - owner-only statistics, broadcasts, Stars/Premium/bonus grants, invoices,
-  payment refunds, login-code access, support replies, sales and Stars-rate controls;
+  payment refunds, login-code access, support replies, Stars-rate controls;
+- admin exact lookup by Telegram ID or phone number (no data dumps);
 - optional required-channel membership gate.
 
-The bot token and Admin API token must never be committed. `.env.example`
-contains names and safe local defaults only.
+## Prerequisites
 
-## Local run
+- Docker and Docker Compose v2+
+- A Telegram Bot token (from @BotFather)
+- A gramsrv Admin API instance with a bearer token
+- PostgreSQL (managed by Docker Compose)
 
-Requirements: Node.js 22.13 or newer and a running gramsrv Admin API.
+## Installation
 
 ```bash
-cd cmd/bots/grammystore
-cp .env.example .env
+sudo mkdir -p /opt/grammystore
+cd /opt/grammystore
+```
+
+Create `.env` from the template:
+
+```bash
+curl -o .env https://raw.githubusercontent.com/iamxvbaba/gramsrv/main/cmd/bots/grammystore/.env.example
 nano .env
-npm ci
-npm test
-npm start
 ```
 
-Set `BOT_PUBLIC_USERNAME` so referral links are available before the first
-`getMe`. `OWNER_IDS` accepts comma-separated Telegram IDs. Users set their
-gramsrv account ID under Settings; Telegram IDs are not assumed to equal server
-account IDs.
+### Required environment variables
 
-`PRODUCT_NAME` controls user-facing product text and defaults to `Telesrv`.
-Deployment-specific branding belongs in the service environment, not in source.
-`DEFAULT_LANGUAGE` is used until Telegram supplies or the user selects a
-supported language. The selection is stored in SQLite and is not overwritten by
-later updates from Telegram. Bot command descriptions are registered separately
-for `ru` and `en` client locales.
+| Variable | Description |
+|---|---|
+| `BOT_TOKEN` | Telegram Bot API token from @BotFather |
+| `OWNER_IDS` | Comma-separated Telegram user IDs for admin access |
+| `GRAMSRV_TOKEN` | Bearer token for the gramsrv Admin API |
+| `PUBLIC_BASE_URL` | Public base URL for the gramsrv instance |
+| `CODE_WEBHOOK_SECRET` | HMAC secret for OTP webhook verification (min 24 chars) |
+| `POSTGRES_PASSWORD` | PostgreSQL password (set a strong value) |
+| `BOT_MODE` | `random` or `real` — controls number generation mode |
 
-Each paid fulfillment is snapshotted in the sales journal. Refunds are phased and
-idempotent: if Telegram is temporarily unavailable after the server-side product
-has been revoked, retrying the same transaction does not revoke it twice. Legacy
-Premium and anonymous-number purchases without exact fulfillment metadata fail
-safe and require manual review instead of touching unrelated account state.
+All required values must not be empty or contain placeholder values such as
+`CHANGE_ME`, `YOUR_*`, `<...>`, or `example`. The application refuses to start
+if any required variable is missing or still contains a placeholder.
 
-## Migrating the former Python bot
+### Bot modes
 
-Never open the legacy database directly with the new service because its table
-names overlap but its columns are incompatible. Keep the old service stopped,
-copy its database, and create a separate destination:
+**Random mode** (`BOT_MODE=random`, default):
+- Users receive a randomly generated phone number on `/start`.
+- Each Telegram user has at most one active number at a time.
+- Numbers persist across bot restarts.
+
+**Real mode** (`BOT_MODE=real`):
+- Users must bind their actual Telegram phone number via contact sharing.
+- Random number generation is rejected server-side.
+- The bound phone is stored in PostgreSQL and survives restarts.
+
+### Production deployment (GHCR image)
 
 ```bash
-npm run migrate:legacy -- /path/to/legacy.sqlite3 /path/to/new.sqlite3
+docker compose pull
+docker compose up -d
 ```
 
-The command refuses to overwrite its source or an existing destination. It
-preserves users, bonus balances, referrals, numbers, current login codes and
-support messages. Keep the legacy database backup for historical orders and
-broadcast drafts, which have no equivalent in the new Telegram Stars journal.
+The production `docker-compose.yml` pulls the pre-built image from
+`ghcr.io/iamxvbaba/gramsrv/grammystore:main`. No local build is required.
+
+### Development deployment (local build)
+
+```bash
+docker compose -f docker-compose-dev.yml --env-file .env up -d --build
+```
+
+The development compose file builds the image locally from the Dockerfile.
+
+## Management
+
+```bash
+# Start
+docker compose up -d
+
+# Stop
+docker compose down
+
+# Restart
+docker compose restart
+
+# View logs
+docker compose logs -f grammystore
+
+# Pull latest production image
+docker compose pull
+docker compose up -d
+
+# Check health
+curl http://localhost:2800/healthz
+```
+
+## PostgreSQL persistence
+
+All data is stored in a PostgreSQL container with a named volume (`pgdata`).
+The schema is initialized automatically from `db/init.sql` on first start.
+
+Back up the database:
+
+```bash
+docker compose exec postgres pg_dump -U grammystore grammystore > backup.sql
+```
+
+Restore:
+
+```bash
+docker compose exec -T postgres psql -U grammystore grammystore < backup.sql
+```
 
 ## Login-code webhook
 
@@ -80,45 +137,74 @@ Configure gramsrv's code-delivery webhook for:
 
 ```text
 TELESRV_PHONE_CODE_DELIVERY_PROVIDER=webhook
-TELESRV_OTP_WEBHOOK_URL=http://127.0.0.1:2800/v1/otp/deliveries
+TELESRV_OTP_WEBHOOK_URL=http://grammystore:2800/v1/otp/deliveries
 TELESRV_OTP_WEBHOOK_SECRET=<same value as CODE_WEBHOOK_SECRET>
 ```
 
-gramsrv sends its version-1 JSON envelope and signs the exact request body as
-`X-Telesrv-Signature: sha256=<HMAC-SHA256(timestamp + "." + body)>`. The bot
-checks that signature, a five-minute timestamp window and `Idempotency-Key`.
-For example, the body contains:
+The endpoint verifies the HMAC-SHA256 signature, a five-minute timestamp
+window and `Idempotency-Key`. It returns HTTP 202 immediately; Telegram
+delivery then runs asynchronously. `/healthz` is read-only.
 
-```json
-{"version":"1","delivery_id":"...","purpose":"login_sms","channel":"sms","recipient":"+79991234567","code":"12345","expires_at":"2026-08-09T12:00:00Z","expires_in":300}
-```
+## Admin lookup
 
-The endpoint is loopback-only by default. It rejects requests without the
-HMAC secret, stores each delivery idempotently and returns HTTP 202 immediately;
-Telegram delivery then runs asynchronously for the number owner and explicitly
-granted support viewers. A slow Bot API therefore cannot turn `auth.sendCode`
-into a server-side timeout. `/healthz` is read-only.
+Administrators can look up specific codes/numbers through the admin panel:
 
-## Linux install
+1. Open the admin panel (`/admin`).
+2. Press "Lookup".
+3. Enter a phone number (with `+`) or a Telegram ID.
 
-```bash
-sudo useradd --system --home /var/lib/gramsrv-grammy-bot --shell /usr/sbin/nologin telesrv-bot || true
-sudo install -d -o telesrv-bot -g telesrv-bot -m 0750 /opt/gramsrv-grammy-bot /var/lib/gramsrv-grammy-bot
-sudo cp -a package.json package-lock.json src /opt/gramsrv-grammy-bot/
-cd /opt/gramsrv-grammy-bot
-sudo npm ci --omit=dev
-sudo cp .env.example /etc/telesrv-grammy-bot.env
-sudo chmod 0600 /etc/telesrv-grammy-bot.env
-sudo cp deploy/telesrv-grammy-bot.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now telesrv-grammy-bot
-sudo journalctl -u telesrv-grammy-bot -f
-```
+The lookup returns only the data for that exact query. There is no command
+that dumps or lists all stored codes or numbers.
 
-Use `BOT_DB_PATH=/var/lib/gramsrv-grammy-bot/bot.sqlite3` in the production env.
-Back up the database with SQLite's online backup command or while the service is
-stopped; include `/etc/telesrv-grammy-bot.env` in a separate encrypted secret
-backup.
+## Migration from the old systemd deployment
 
-The systemd unit intentionally has no hosting-specific values. Do not deploy it
-until the local branch has been reviewed and merged.
+If you are migrating from the previous SQLite-based systemd deployment:
+
+1. **Stop the old bot:**
+   ```bash
+   sudo systemctl stop telesrv-grammy-bot
+   ```
+
+2. **Back up the old SQLite database:**
+   ```bash
+   sudo cp /var/lib/gramsrv-grammy-bot/bot.sqlite3 /tmp/grammystore-backup.sqlite3
+   ```
+
+3. **Configure the new `.env`** as described above. Set `BOT_MODE` to match
+   your previous configuration.
+
+4. **Deploy the Docker stack:**
+   ```bash
+   cd /opt/grammystore
+   docker compose pull
+   docker compose up -d
+   ```
+
+5. **Verify the deployment:**
+   ```bash
+   docker compose logs -f grammystore
+   curl http://localhost:2800/healthz
+   ```
+
+6. **Remove the old systemd service:**
+   ```bash
+   sudo systemctl disable telesrv-grammy-bot
+   sudo rm /etc/systemd/system/telesrv-grammy-bot.service
+   sudo rm /etc/telesrv-grammy-bot.env
+   sudo rm -rf /opt/gramsrv-grammy-bot
+   sudo systemctl daemon-reload
+   ```
+
+The old SQLite database format is not directly compatible with PostgreSQL.
+Existing users will need to re-register with the bot. Login codes and
+number assignments will be重新 generated on the first `/start`.
+
+## Container image
+
+The GHCR image coexists with the main server images under the same package:
+
+- `ghcr.io/iamxvbaba/gramsrv/server`
+- `ghcr.io/iamxvbaba/gramsrv/admin`
+- `ghcr.io/iamxvbaba/gramsrv/grammystore`
+
+All three images are published from the same repository.
