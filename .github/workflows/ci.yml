@@ -37,6 +37,11 @@ jobs:
       - name: Test
         run: go test ./... -count=1
 
+      - name: Verify legacy Compose credentials and volume upgrade
+        env:
+          TELESRV_RUN_COMPOSE_INTEGRATION: '1'
+        run: go test ./deploy -run '^TestLegacyComposeCredentialsIntegration$' -count=1 -timeout=5m
+
   admin-web:
     name: Admin web build
     runs-on: ubuntu-24.04

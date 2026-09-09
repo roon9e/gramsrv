@@ -61,6 +61,55 @@ func TestLoadDefaultsAdvertiseIPToLoopback(t *testing.T) {
 	}
 }
 
+func TestLoadBuildsPostgresDSNFromPassword(t *testing.T) {
+	disableDefaultConfigFile(t)
+	t.Setenv("TELESRV_POSTGRES_DSN", "")
+	t.Setenv("TELESRV_POSTGRES_PASSWORD", "p@ss:word/with?reserved#chars")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := "postgres://telesrv:p%40ss%3Aword%2Fwith%3Freserved%23chars@127.0.0.1:5432/telesrv_main?sslmode=disable"
+	if cfg.PostgresDSN != want {
+		t.Fatalf("PostgresDSN = %q, want %q", cfg.PostgresDSN, want)
+	}
+}
+
+func TestLoadPreservesExplicitPostgresDSN(t *testing.T) {
+	disableDefaultConfigFile(t)
+	want := "postgres://external:secret@db.example:5432/app?sslmode=require"
+	t.Setenv("TELESRV_POSTGRES_DSN", want)
+	t.Setenv("TELESRV_POSTGRES_PASSWORD", "ignored")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PostgresDSN != want {
+		t.Fatalf("PostgresDSN = %q, want explicit DSN %q", cfg.PostgresDSN, want)
+	}
+}
+
+func TestLoadEmptyProcessPasswordsOverrideFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	writeConfigFile(t, path, "TELESRV_POSTGRES_PASSWORD=from-file\nTELESRV_REDIS_PASSWORD=from-file\n")
+	t.Setenv("TELESRV_CONFIG", path)
+	t.Setenv("TELESRV_POSTGRES_DSN", "")
+	t.Setenv("TELESRV_POSTGRES_PASSWORD", "")
+	t.Setenv("TELESRV_REDIS_PASSWORD", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PostgresDSN != "postgres://telesrv:telesrv@127.0.0.1:5432/telesrv_main?sslmode=disable" {
+		t.Fatal("empty process Postgres password must select the Compose default")
+	}
+	if cfg.RedisPassword != "" {
+		t.Fatal("empty process Redis password must override the config file")
+	}
+}
+
 func TestLoadDialogListSnapshotRedisTTL(t *testing.T) {
 	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_DIALOG_LIST_SNAPSHOT_REDIS_TTL", "37m")
