@@ -882,7 +882,7 @@ func Load() (Config, error) {
 		PostgresMaxConns: envIntOr("TELESRV_POSTGRES_MAX_CONNS", 50),
 		PostgresMinConns: envIntOr("TELESRV_POSTGRES_MIN_CONNS", 16),
 		RedisAddr:        envOr("TELESRV_REDIS_ADDR", "127.0.0.1:6399"), // 同理避开 localhost→IPv6 回退延迟
-		RedisPassword:    envOr("TELESRV_REDIS_PASSWORD", ""),
+		RedisPassword:    envAllowEmptyOr("TELESRV_REDIS_PASSWORD", ""),
 		RedisDB:          envIntOr("TELESRV_REDIS_DB", 0),
 
 		DevAuthCode:                       envOr("TELESRV_DEV_AUTH_CODE", "12345"),
@@ -1986,9 +1986,15 @@ func postgresDSN(e envSource) string {
 	if dsn := e.envOr("TELESRV_POSTGRES_DSN", ""); dsn != "" {
 		return dsn
 	}
+	// Match Compose's ${TELESRV_POSTGRES_PASSWORD:-telesrv}: an explicitly
+	// empty process value overrides the file, then selects the local default.
+	password := e.envAllowEmptyOr("TELESRV_POSTGRES_PASSWORD", "")
+	if password == "" {
+		password = "telesrv"
+	}
 	u := url.URL{
 		Scheme: "postgres",
-		User:   url.UserPassword("telesrv", e.envOr("TELESRV_POSTGRES_PASSWORD", "telesrv")),
+		User:   url.UserPassword("telesrv", password),
 		Host:   "127.0.0.1:5432",
 		Path:   "/telesrv_main",
 	}

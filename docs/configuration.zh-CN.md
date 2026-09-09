@@ -426,7 +426,7 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 | `TELESRV_POSTGRES_MAX_CONNS` | int / `50` | 单个 pgxpool 最大连接数；`<=0` 使用 pgx 默认值。实际新建 backend 还受同一 PostgreSQL 实例的 server-wide advisory admission 限制，不是各进程可相加的静态预算。 |
 | `TELESRV_POSTGRES_MIN_CONNS` | int / `16` | pgxpool 预热最小连接数；minimum 保留，超过 minimum 的 burst connection 在 5 秒 idle 后弹性归还全局 admission slot。 |
 | `TELESRV_REDIS_ADDR` | address / `127.0.0.1:6399` | 验证码、限流、共享更新/缓存易失态使用的 Redis。 |
-| `TELESRV_REDIS_PASSWORD` | secret string / 空 | Redis 密码。 |
+| `TELESRV_REDIS_PASSWORD` | secret string / 空 | Redis 密码，与旧版开发 Compose 容器共用。为空时保留原有开发环境免密行为；修改后需重启客户端进程。 |
 | `TELESRV_REDIS_DB` | int / `0` | Redis 逻辑库编号。 |
 | `TELESRV_LANGPACK_SEED_DIR` | path / `data/langpack` | TDesktop `.strings` 语言包 seed 目录。 |
 | `TELESRV_OFFICIAL_GIFTS_DIR` | path / `data/official-gifts` | `cmd/giftfetch` 生成的只读官方礼物快照；供管理后台选择、验哈希并显式导入。 |
