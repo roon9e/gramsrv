@@ -13,7 +13,7 @@ permissions:
   packages: write
 
 concurrency:
-  container-grammystore-${{ github.ref }}
+  group: container-grammystore-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

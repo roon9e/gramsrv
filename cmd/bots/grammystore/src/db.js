@@ -34,6 +34,7 @@ function generatedNumber(format, country) {
 export class BotDatabase {
   constructor(dbUrl) {
     this.pool = new pg.Pool({ connectionString: dbUrl, max: 10, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000 });
+    pg.types.setTypeParser(20, (val) => Number(val));
   }
 
   async close() { await this.pool.end(); }

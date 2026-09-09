@@ -50,7 +50,7 @@ function mockDb() {
     },
     markRefundInternal: async (chargeID) => { const r = refunds.get(chargeID); if (r) { r.internal_reversed = true; r.status = "internal_reversed"; } },
     markRefunded: async (chargeID) => { const r = refunds.get(chargeID); if (r) { r.status = "completed"; r.internal_reversed = true; } },
-    failRefund: async (chargeID) => { const r = refunds.get(chargeID); if (r) r.status = "failed"; },
+    failRefund: async (chargeID) => { const r = refunds.get(chargeID); if (r) r.status = r.internal_reversed ? "internal_reversed" : "failed"; },
     isRefunded: async (chargeID) => refunds.get(chargeID)?.status === "completed",
     refundByCharge: async (id) => refunds.get(id) ?? null,
   };
@@ -71,7 +71,7 @@ test("Telegram retry does not debit the internal product twice", async () => {
     refundStarPayment: async () => { throw new Error("temporary Telegram failure"); },
   }), /temporary/);
   const afterFail = await db.refundByCharge("charge-retry");
-  assert.equal(afterFail.status, "failed");
+  assert.equal(afterFail.status, "internal_reversed");
   await executeCompensatedRefund({ sale, telegramID: 7, db, gramsrv, refundStarPayment: async () => true });
   assert.equal(debits.length, 1);
   assert.equal(await db.isRefunded("charge-retry"), true);
