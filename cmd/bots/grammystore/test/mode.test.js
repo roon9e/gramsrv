@@ -166,6 +166,23 @@ test("real mode shows phone binding in numbers menu", async () => {
   assert.match(sent.payload.text, /Phone binding|Привязка номера/i);
 });
 
+test("real mode shows a purchased anonymous number in numbers menu", async () => {
+  const { bot, calls, db } = createBotWithMode("real");
+  await db.upsertUser({ id: 10, first_name: "User" }, 10, "ru");
+  await db.createNumber(10, 10, "short", "ANON", true);
+  await bot.handleUpdate({
+    update_id: 1,
+    callback_query: {
+      id: "cb-1", from: { id: 10, is_bot: false, first_name: "User" },
+      chat_instance: "instance", data: "menu:numbers",
+      message: { message_id: 1, date: 1, chat: { id: 10, type: "private" }, text: "Numbers" },
+    },
+  });
+  const edit = calls.find((c) => c.method === "editMessageText");
+  assert.ok(edit, "Real mode should show the purchased number");
+  assert.match(edit.payload.text, /\+7999/);
+});
+
 test("random mode numbers menu shows number list", async () => {
   const { bot, calls, db } = createBotWithMode("random");
   await db.upsertUser({ id: 10, first_name: "User" }, 10, "ru");
@@ -181,6 +198,7 @@ test("random mode numbers menu shows number list", async () => {
   const edit = calls.find((c) => c.method === "editMessageText");
   assert.ok(edit, "Random mode numbers menu should show number list");
   assert.match(edit.payload.text, /\+7/);
+  assert.doesNotMatch(edit.payload.text, /12345/);
 });
 
 test("real mode allows buying anonymous +888 number products", async () => {
@@ -198,6 +216,23 @@ test("real mode allows buying anonymous +888 number products", async () => {
   assert.ok(edit, "Real mode should show anonymous number products");
   const labels = edit.payload.reply_markup.inline_keyboard.flat().map((button) => button.text).join("\n");
   assert.match(labels, /\+888/);
+});
+
+test("real mode rejects a second anonymous number purchase", async () => {
+  const { bot, calls, db } = createBotWithMode("real");
+  await db.upsertUser({ id: 10, first_name: "User" }, 10, "ru");
+  await db.createNumber(10, 10, "short", "ANON", true);
+  await bot.handleUpdate({
+    update_id: 1,
+    callback_query: {
+      id: "cb-1", from: { id: 10, is_bot: false, first_name: "User" },
+      chat_instance: "instance", data: "buy:num_short:0",
+      message: { message_id: 1, date: 1, chat: { id: 10, type: "private" }, text: "Product" },
+    },
+  });
+  const sent = calls.find((c) => c.method === "sendMessage");
+  assert.match(sent.payload.text, /already have|уже есть/i);
+  assert.equal(calls.some((c) => c.method === "sendInvoice"), false);
 });
 
 test("real mode allows shop for non-number products", async () => {

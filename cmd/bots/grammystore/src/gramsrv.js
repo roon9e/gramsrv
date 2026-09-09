@@ -28,6 +28,10 @@ export class GramsrvClient {
     return this.post("/v1/accounts/debit-stars", this.command(reason, { user_id: userID, amount }, idempotencyKey));
   }
 
+  setPhone(userID, phone, reason = "Telegram bot number replacement", idempotencyKey = "") {
+    return this.post("/v1/accounts/set-phone", this.command(reason, { user_id: userID, phone }, idempotencyKey));
+  }
+
   grantPremium(userID, months, reason = "Telegram bot purchase", idempotencyKey = "") {
     return this.post("/v1/accounts/grant-premium", this.command(reason, { user_id: userID, months }, idempotencyKey));
   }

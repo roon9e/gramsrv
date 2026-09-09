@@ -140,15 +140,18 @@ export class BotDatabase {
     return this.tx(async (client) => {
       const current = (await client.query("SELECT * FROM numbers WHERE owner_id = $1 AND is_current = TRUE", [ownerID])).rows[0] ?? null;
       if (current && !replace) return current;
-      if (replace) await client.query("UPDATE numbers SET is_current = FALSE WHERE owner_id = $1 AND is_current = TRUE", [ownerID]);
+      if (current && current.format !== "free") throw new Error("account already has an active anonymous number");
+      if (replace) {
+        await client.query("DELETE FROM code_access WHERE phone IN (SELECT phone FROM numbers WHERE owner_id = $1 AND format = 'free')", [ownerID]);
+        await client.query("DELETE FROM numbers WHERE owner_id = $1 AND format = 'free'", [ownerID]);
+      }
       for (let attempt = 0; attempt < 400; attempt++) {
         const generated = generatedNumber(format, country);
-        const code = String(randomInt(10000, 100000));
         try {
           const result = await client.query(
             `INSERT INTO numbers(phone, display, format, country, owner_id, chat_id, is_current, login_code, code_expires_at, created_at)
-             VALUES($1, $2, $3, $4, $5, $6, TRUE, $7, $8, $9) RETURNING *`,
-            [generated.phone, generated.display, format, generated.country, ownerID, chatID, code, now() + 300, now()]
+             VALUES($1, $2, $3, $4, $5, $6, TRUE, '', 0, $7) RETURNING *`,
+            [generated.phone, generated.display, format, generated.country, ownerID, chatID, now()]
           );
           return result.rows[0];
         } catch (error) {
@@ -170,7 +173,7 @@ export class BotDatabase {
   }
 
   async findNumber(phone) {
-    const res = await this.pool.query("SELECT * FROM numbers WHERE phone = $1 ORDER BY is_current DESC, id DESC LIMIT 1", [normalizePhone(phone)]);
+    const res = await this.pool.query("SELECT * FROM numbers WHERE phone = $1 AND is_current = TRUE ORDER BY id DESC LIMIT 1", [normalizePhone(phone)]);
     return res.rows[0] ?? null;
   }
 
@@ -181,8 +184,8 @@ export class BotDatabase {
   async updateLoginCode(phone, code, expiresAt = now() + 300) {
     phone = normalizePhone(phone);
     return this.tx(async (client) => {
-      await client.query("UPDATE numbers SET login_code = $1, code_expires_at = $2 WHERE phone = $3", [String(code), expiresAt, phone]);
-      const number = (await client.query("SELECT * FROM numbers WHERE phone = $1 ORDER BY is_current DESC, id DESC LIMIT 1", [phone])).rows[0] ?? null;
+      await client.query("UPDATE numbers SET login_code = $1, code_expires_at = $2 WHERE phone = $3 AND is_current = TRUE", [String(code), expiresAt, phone]);
+      const number = (await client.query("SELECT * FROM numbers WHERE phone = $1 AND is_current = TRUE ORDER BY id DESC LIMIT 1", [phone])).rows[0] ?? null;
       const access = (await client.query(
         "SELECT u.chat_id FROM code_access a JOIN users u ON u.telegram_id = a.telegram_id WHERE a.phone = $1", [phone]
       )).rows;
@@ -198,15 +201,15 @@ export class BotDatabase {
       const existing = (await client.query("SELECT * FROM otp_deliveries WHERE delivery_id = $1", [deliveryID])).rows[0];
       if (existing) {
         if (existing.fingerprint !== fingerprint) throw new Error("IDEMPOTENCY_CONFLICT");
-        const number = (await client.query("SELECT * FROM numbers WHERE phone = $1 ORDER BY is_current DESC, id DESC LIMIT 1", [existing.recipient])).rows[0] ?? null;
+        const number = (await client.query("SELECT * FROM numbers WHERE phone = $1 AND is_current = TRUE ORDER BY id DESC LIMIT 1", [existing.recipient])).rows[0] ?? null;
         return { duplicate: true, number, chatIDs: [] };
       }
       await client.query(
         "INSERT INTO otp_deliveries(delivery_id, fingerprint, recipient, code, expires_at, accepted_at) VALUES($1, $2, $3, $4, $5, $6)",
         [deliveryID, fingerprint, phone, String(code), expiresAt, now()]
       );
-      await client.query("UPDATE numbers SET login_code = $1, code_expires_at = $2 WHERE phone = $3", [String(code), expiresAt, phone]);
-      const number = (await client.query("SELECT * FROM numbers WHERE phone = $1 ORDER BY is_current DESC, id DESC LIMIT 1", [phone])).rows[0] ?? null;
+      await client.query("UPDATE numbers SET login_code = $1, code_expires_at = $2 WHERE phone = $3 AND is_current = TRUE", [String(code), expiresAt, phone]);
+      const number = (await client.query("SELECT * FROM numbers WHERE phone = $1 AND is_current = TRUE ORDER BY id DESC LIMIT 1", [phone])).rows[0] ?? null;
       const access = (await client.query(
         "SELECT u.chat_id FROM code_access a JOIN users u ON u.telegram_id = a.telegram_id WHERE a.phone = $1", [phone]
       )).rows;

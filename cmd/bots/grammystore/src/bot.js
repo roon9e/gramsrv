@@ -164,6 +164,12 @@ function parseStartRef(ctx) {
   return match ? Number(match[1]) : 0;
 }
 
+async function syncFreeNumber(gramsrv, user, number) {
+  if (user?.server_user_id > 0) {
+    await gramsrv.setPhone(user.server_user_id, number.phone, `number:${number.id}`);
+  }
+}
+
 function productText(product, language) {
   const extra = product.kind === KINDS.username
     ? `\n${translate(language, "productBid", { bid: product.bid })}`
@@ -180,6 +186,11 @@ function productKeyboard(product, db, buyerID, language) {
   if (selfID > 0) kb.text(translate(language, "buySelf"), `buy:${product.code}:${selfID}`).row();
   kb.text(translate(language, "giftOther"), `target:${product.code}`).row();
   return kb.row().text(translate(language, "back"), `shop:${product.kind}`);
+}
+
+async function hasActiveAnonymousNumber(db, ownerID) {
+  const current = await db.currentNumber(ownerID);
+  return Boolean(current && current.format !== "free");
 }
 
 async function sendInvoice(ctx, product, targetUserID, language, extra = "") {
@@ -224,6 +235,7 @@ export function createBot({ config, db, gramsrv }) {
 
     if (isRandomMode(config)) {
       const number = await db.createNumber(ctx.from.id, ctx.chat.id, "free", config.defaultNumberCountry, false);
+      await syncFreeNumber(gramsrv, user, number);
       const referralApplied = !existed && referrer > 0 && (await db.user(ctx.from.id))?.referred_by === referrer;
       const lines = [tr(ctx.from.id, "startHello"), tr(ctx.from.id, "startPhone", { phone: escapeHTML(number.display) })];
       if (referralApplied) lines.push(tr(ctx.from.id, "referralAccepted"));
@@ -278,7 +290,8 @@ export function createBot({ config, db, gramsrv }) {
         const parsed = parsePayload(ctx.preCheckoutQuery.invoice_payload);
         const product = findProduct(parsed.code, await db.starsRate());
         if (!product || product.starsPrice !== ctx.preCheckoutQuery.total_amount ||
-            (product.kind === KINDS.stars && parsed.starsAmount <= 0)) throw new Error("product price changed");
+          (product.kind === KINDS.stars && parsed.starsAmount <= 0) ||
+          (product.kind === KINDS.number && await hasActiveAnonymousNumber(db, ctx.from.id))) throw new Error("number already owned");
       }
       await ctx.answerPreCheckoutQuery(true);
     } catch {
@@ -363,21 +376,25 @@ export function createBot({ config, db, gramsrv }) {
     const language = languageOf(ctx.from.id);
     if (page === "home") return editOrReply(ctx, tr(ctx.from.id, "menuTitle"), mainKeyboard(language, isOwner(config, ctx.from.id)));
     if (page === "numbers") {
+      const currentNumber = await db.currentNumber(ctx.from.id);
       if (isRealMode(config)) {
         const bound = await db.verifiedPhone(ctx.from.id);
-        if (!bound) {
+        if (!bound && !currentNumber) {
           const { phoneShareKeyboard } = await import("./real-number.js");
           return ctx.reply(`${tr(ctx.from.id, "phoneTitle")}\n\n${tr(ctx.from.id, "phoneIntro")}`, { parse_mode: "HTML", reply_markup: phoneShareKeyboard(language) });
         }
-        const kb = new InlineKeyboard().text(tr(ctx.from.id, "phoneUnbindButton"), "phone:unbind").row().text(tr(ctx.from.id, "back"), "menu:home");
-        return editOrReply(ctx, `${tr(ctx.from.id, "phoneTitle")}\n\n${tr(ctx.from.id, "phoneStatus", { phone: escapeHTML(bound.phone) })}`, kb);
+        const lines = [tr(ctx.from.id, "numbersTitle")];
+        if (bound) lines.push(tr(ctx.from.id, "phoneStatus", { phone: escapeHTML(bound.phone) }));
+        if (currentNumber) lines.push(tr(ctx.from.id, "numberReserved", { phone: escapeHTML(currentNumber.display) }));
+        const kb = new InlineKeyboard();
+        if (bound) kb.text(tr(ctx.from.id, "phoneUnbindButton"), "phone:unbind").row();
+        kb.text(tr(ctx.from.id, "back"), "menu:home");
+        return editOrReply(ctx, lines.join("\n\n"), kb);
       }
       const numbers = await db.numbers(ctx.from.id);
-      const current = await db.currentNumber(ctx.from.id);
       const list = numbers.slice(0, 10).map((number) => `${number.is_current ? "▶️" : "▫️"} <code>${escapeHTML(number.display)}</code>`).join("\n");
-      const code = current?.login_code && current.code_expires_at >= Math.floor(Date.now() / 1000) ? `<code>${current.login_code}</code>` : tr(ctx.from.id, "noCode");
       const kb = new InlineKeyboard().text(tr(ctx.from.id, "newFreeNumber"), "numbers:new").row().text(tr(ctx.from.id, "back"), "menu:home");
-      return editOrReply(ctx, `${tr(ctx.from.id, "numbersTitle")}\n\n${list || "—"}\n\n🔑 ${code}`, kb);
+      return editOrReply(ctx, `${tr(ctx.from.id, "numbersTitle")}\n\n${list || "—"}`, kb);
     }
     if (page === "shop") return editOrReply(ctx, tr(ctx.from.id, "shopTitle"), shopKeyboard(language));
     if (page === "bonuses") {
@@ -409,6 +426,8 @@ export function createBot({ config, db, gramsrv }) {
     if (rejectRandomInRealMode(ctx, config, languageOf(ctx.from.id))) return;
     const language = languageOf(ctx.from.id);
     const number = await db.createNumber(ctx.from.id, ctx.chat.id, "free", ctx.match[1], true);
+    const user = await db.user(ctx.from.id);
+    await syncFreeNumber(gramsrv, user, number);
     await editOrReply(ctx, tr(ctx.from.id, "newNumber", { phone: escapeHTML(number.display) }), backKeyboard(language, "menu:numbers"));
   });
 
@@ -456,6 +475,9 @@ export function createBot({ config, db, gramsrv }) {
     const targetID = Number(ctx.match[2]);
     if (!product) return;
     const language = languageOf(ctx.from.id);
+    if (product.kind === KINDS.number && await hasActiveAnonymousNumber(db, ctx.from.id)) {
+      return ctx.reply(tr(ctx.from.id, "errorNumberAlreadyOwned"));
+    }
     if (product.kind === KINDS.username) {
       await db.setPending(ctx.from.id, "username", { productCode: product.code, targetID });
       return editOrReply(ctx, tr(ctx.from.id, "enterUsername"), backKeyboard(language, `product:${product.code}`));
