@@ -225,7 +225,7 @@ export function createBot({ config, db, gramsrv }) {
     if (isRandomMode(config)) {
       const number = await db.createNumber(ctx.from.id, ctx.chat.id, "free", config.defaultNumberCountry, false);
       const referralApplied = !existed && referrer > 0 && (await db.user(ctx.from.id))?.referred_by === referrer;
-      const lines = [tr(ctx.from.id, "startHello"), tr(ctx.from.id, "startPhone", { phone: escapeHTML(number.display) }), tr(ctx.from.id, "startInitialCode", { code: number.login_code })];
+      const lines = [tr(ctx.from.id, "startHello"), tr(ctx.from.id, "startPhone", { phone: escapeHTML(number.display) })];
       if (referralApplied) lines.push(tr(ctx.from.id, "referralAccepted"));
       await ctx.reply(lines.join("\n\n"), { parse_mode: "HTML", reply_markup: mainKeyboard(language, isOwner(config, ctx.from.id)) });
     } else {
@@ -409,13 +409,12 @@ export function createBot({ config, db, gramsrv }) {
     if (rejectRandomInRealMode(ctx, config, languageOf(ctx.from.id))) return;
     const language = languageOf(ctx.from.id);
     const number = await db.createNumber(ctx.from.id, ctx.chat.id, "free", ctx.match[1], true);
-    await editOrReply(ctx, tr(ctx.from.id, "newNumber", { phone: escapeHTML(number.display), code: number.login_code }), backKeyboard(language, "menu:numbers"));
+    await editOrReply(ctx, tr(ctx.from.id, "newNumber", { phone: escapeHTML(number.display) }), backKeyboard(language, "menu:numbers"));
   });
 
   bot.callbackQuery(/^shop:(premium|stars|number|username)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     const kind = ctx.match[1];
-    if (kind === "number" && rejectRandomInRealMode(ctx, config, languageOf(ctx.from.id))) return;
     const language = languageOf(ctx.from.id);
     const kb = new InlineKeyboard();
     const starsRate = await db.starsRate();
@@ -439,7 +438,6 @@ export function createBot({ config, db, gramsrv }) {
     const starsRate = await db.starsRate();
     const product = findProduct(ctx.match[1], starsRate);
     if (!product) return;
-    if (product.kind === KINDS.number && rejectRandomInRealMode(ctx, config, languageOf(ctx.from.id))) return;
     const language = languageOf(ctx.from.id);
     const view = localizeProduct(product, language);
     await editOrReply(ctx, productText(view, language), productKeyboard(product, { _cachedUser: db._userCache.get(ctx.from.id) }, ctx.from.id, language));
@@ -457,7 +455,6 @@ export function createBot({ config, db, gramsrv }) {
     const product = findProduct(ctx.match[1], starsRate);
     const targetID = Number(ctx.match[2]);
     if (!product) return;
-    if (product.kind === KINDS.number && rejectRandomInRealMode(ctx, config, languageOf(ctx.from.id))) return;
     const language = languageOf(ctx.from.id);
     if (product.kind === KINDS.username) {
       await db.setPending(ctx.from.id, "username", { productCode: product.code, targetID });

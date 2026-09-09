@@ -183,7 +183,7 @@ test("random mode numbers menu shows number list", async () => {
   assert.match(edit.payload.text, /\+7/);
 });
 
-test("real mode shop hides +888 number products", async () => {
+test("real mode allows buying anonymous +888 number products", async () => {
   const { bot, calls, db } = createBotWithMode("real");
   await db.upsertUser({ id: 10, first_name: "User" }, 10, "ru");
   await bot.handleUpdate({
@@ -194,9 +194,10 @@ test("real mode shop hides +888 number products", async () => {
       message: { message_id: 1, date: 1, chat: { id: 10, type: "private" }, text: "Shop" },
     },
   });
-  const sent = calls.find((c) => c.method === "sendMessage");
-  assert.ok(sent, "Real mode should reject number shop access");
-  assert.match(sent.payload.text, /not available|недоступна/i);
+  const edit = calls.find((c) => c.method === "editMessageText");
+  assert.ok(edit, "Real mode should show anonymous number products");
+  const labels = edit.payload.reply_markup.inline_keyboard.flat().map((button) => button.text).join("\n");
+  assert.match(labels, /\+888/);
 });
 
 test("real mode allows shop for non-number products", async () => {
