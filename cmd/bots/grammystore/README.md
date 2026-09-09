@@ -22,7 +22,8 @@ independently from the main MTProto server; a bot outage cannot stop MTProto.
 - owner-only statistics, broadcasts, Stars/Premium/bonus grants, invoices,
   payment refunds, login-code access, support replies, Stars-rate controls;
 - admin exact lookup by Telegram ID or phone number (no data dumps);
-- optional required-channel membership gate.
+- optional required-channel membership gate;
+- optional SOCKS5 proxy for Telegram API (for regions where Telegram is blocked).
 
 ## Prerequisites
 
@@ -31,7 +32,68 @@ independently from the main MTProto server; a bot outage cannot stop MTProto.
 - A gramsrv Admin API instance with a bearer token
 - PostgreSQL (managed by Docker Compose)
 
-## Installation
+## Development setup
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/iamxvbaba/gramsrv.git
+cd gramsrv
+```
+
+### 2. Copy the grammystore directory
+
+The bot lives under `cmd/bots/grammystore/`. All files needed for
+standalone deployment are already in this directory:
+
+```text
+cmd/bots/grammystore/
+  src/              # Application source code
+  db/init.sql       # PostgreSQL schema
+  test/             # Test suite
+  Dockerfile        # Container image
+  docker-compose.yml       # Production (GHCR image)
+  docker-compose-dev.yml   # Development (local build)
+  .env.example      # Environment variable template
+  package.json      # Node.js dependencies
+```
+
+### 3. Create your `.env` file
+
+```bash
+cd cmd/bots/grammystore
+cp .env.example .env
+nano .env
+```
+
+Fill in at minimum: `BOT_TOKEN`, `OWNER_IDS`, `GRAMSRV_TOKEN`,
+`CODE_WEBHOOK_SECRET`, `POSTGRES_PASSWORD`.
+
+### 4. Start the development stack
+
+```bash
+docker compose -f docker-compose-dev.yml --env-file .env up -d --build
+```
+
+This builds the image locally and starts PostgreSQL + the bot.
+
+### 5. View logs
+
+```bash
+docker compose -f docker-compose-dev.yml logs -f grammystore
+```
+
+### 6. Run tests (without Docker)
+
+```bash
+npm install
+npm test
+```
+
+DB tests require a running PostgreSQL instance. They are skipped when
+`DATABASE_URL` is not set.
+
+## Installation (production)
 
 ```bash
 sudo mkdir -p /opt/grammystore
@@ -60,6 +122,32 @@ nano .env
 All required values must not be empty or contain placeholder values such as
 `CHANGE_ME`, `YOUR_*`, `<...>`, or `example`. The application refuses to start
 if any required variable is missing or still contains a placeholder.
+
+### SOCKS5 proxy (for Russia and other blocked regions)
+
+Telegram API is blocked in Russia. Configure a SOCKS5 proxy to route bot
+API traffic through an accessible server:
+
+| Variable | Description |
+|---|---|
+| `TELEGRAM_PROXY_URL` | SOCKS5 proxy URL, e.g. `socks5h://host:1080` |
+| `TELEGRAM_PROXY_USERNAME` | Proxy username (if authentication is required) |
+| `TELEGRAM_PROXY_PASSWORD` | Proxy password (if authentication is required) |
+
+Use `socks5h://` (with `h`) for remote DNS resolution — the proxy resolves
+`api.telegram.org` to an IP, avoiding local DNS blocking. Use `socks5://`
+for local DNS resolution (the client resolves the hostname before connecting).
+
+Example `.env`:
+
+```text
+TELEGRAM_PROXY_URL=socks5h://your-proxy-host:1080
+TELEGRAM_PROXY_USERNAME=myuser
+TELEGRAM_PROXY_PASSWORD=mypassword
+```
+
+If `TELEGRAM_PROXY_URL` is empty or unset, the bot connects directly to
+Telegram without a proxy.
 
 ### Bot modes
 
@@ -155,49 +243,6 @@ Administrators can look up specific codes/numbers through the admin panel:
 
 The lookup returns only the data for that exact query. There is no command
 that dumps or lists all stored codes or numbers.
-
-## Migration from the old systemd deployment
-
-If you are migrating from the previous SQLite-based systemd deployment:
-
-1. **Stop the old bot:**
-   ```bash
-   sudo systemctl stop telesrv-grammy-bot
-   ```
-
-2. **Back up the old SQLite database:**
-   ```bash
-   sudo cp /var/lib/gramsrv-grammy-bot/bot.sqlite3 /tmp/grammystore-backup.sqlite3
-   ```
-
-3. **Configure the new `.env`** as described above. Set `BOT_MODE` to match
-   your previous configuration.
-
-4. **Deploy the Docker stack:**
-   ```bash
-   cd /opt/grammystore
-   docker compose pull
-   docker compose up -d
-   ```
-
-5. **Verify the deployment:**
-   ```bash
-   docker compose logs -f grammystore
-   curl http://localhost:2800/healthz
-   ```
-
-6. **Remove the old systemd service:**
-   ```bash
-   sudo systemctl disable telesrv-grammy-bot
-   sudo rm /etc/systemd/system/telesrv-grammy-bot.service
-   sudo rm /etc/telesrv-grammy-bot.env
-   sudo rm -rf /opt/gramsrv-grammy-bot
-   sudo systemctl daemon-reload
-   ```
-
-The old SQLite database format is not directly compatible with PostgreSQL.
-Existing users will need to re-register with the bot. Login codes and
-number assignments will be重新 generated on the first `/start`.
 
 ## Container image
 

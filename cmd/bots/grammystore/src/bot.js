@@ -3,6 +3,7 @@ import { randomInt } from "node:crypto";
 import { buildPayload, findProduct, KINDS, localizeProduct, normalizeUsername, parsePayload, productsOfKind } from "./catalog.js";
 import { normalizeLanguage, translate, translateError } from "./i18n.js";
 import { isRandomMode, isRealMode, rejectRandomInRealMode } from "./real-number.js";
+import { createProxyAgent, describeProxy } from "./proxy.js";
 
 const spinPrizes = Object.freeze([
   { amount: 50, weight: 250 }, { amount: 100, weight: 130 }, { amount: 500, weight: 50 },
@@ -195,7 +196,9 @@ function rollPrize() {
 }
 
 export function createBot({ config, db, gramsrv }) {
-  const bot = new Bot(config.botToken);
+  const bot = config.telegramProxy
+    ? new Bot(config.botToken, { client: { baseFetchConfig: { agent: createProxyAgent(config.telegramProxy) } } })
+    : new Bot(config.botToken);
   const languageOf = (id) => normalizeLanguage(db._userCache?.get(id)?.language, config.defaultLanguage);
   const tr = (id, key, variables = {}) => translate(languageOf(id), key, { product: escapeHTML(config.productName), ...variables });
   const localized = (id, product) => localizeProduct(product, languageOf(id));

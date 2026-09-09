@@ -6,6 +6,7 @@ import { commandList, createBot } from "./bot.js";
 import { normalizeLanguage, translate } from "./i18n.js";
 import { parseTelesrvDelivery, verifyTelesrvSignature } from "./otp.js";
 import { isRealMode } from "./real-number.js";
+import { describeProxy } from "./proxy.js";
 
 const config = loadConfig();
 const db = new BotDatabase(config.dbUrl);
@@ -80,6 +81,7 @@ const me = await bot.api.getMe();
 bot.botInfo = me;
 console.log(`Starting @${me.username}`);
 console.log(`Bot mode: ${config.botMode}`);
+if (config.telegramProxy) console.log(`Proxy: ${describeProxy(config.telegramProxy)}`);
 await bot.api.setMyCommands(commandList(config.defaultLanguage));
 await bot.api.setMyCommands(commandList("ru"), { language_code: "ru" });
 await bot.api.setMyCommands(commandList("en"), { language_code: "en" });

@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { parseProxyURL } from "./proxy.js";
 
 const PLACEHOLDER_PATTERN = /^(CHANGE_ME|YOUR[_A-Z]*|<.+>|example|replace.with)/i;
 
@@ -38,6 +39,10 @@ export function loadConfig() {
   const mode = botMode();
   return Object.freeze({
     botToken: required("BOT_TOKEN"),
+    telegramProxy: parseProxyURL(process.env.TELEGRAM_PROXY_URL, {
+      username: process.env.TELEGRAM_PROXY_USERNAME,
+      password: process.env.TELEGRAM_PROXY_PASSWORD,
+    }),
     productName: (process.env.PRODUCT_NAME ?? "Telesrv").trim() || "Telesrv",
     ownerIDs: ownerIDs(),
     publicUsername: (process.env.BOT_PUBLIC_USERNAME ?? "").replace(/^@/, "").trim(),
