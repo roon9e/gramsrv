@@ -14,7 +14,7 @@ func TestLegacyComposeConfigMatrix(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker is not installed")
 	}
-	root := filepath.Dir(filepath.Dir(mustAbs(t, "deploy/docker-compose_test.go")))
+	root := repositoryRoot(t)
 	compose := filepath.Join(root, "deploy", "docker-compose.yml")
 	example, err := os.ReadFile(filepath.Join(root, ".env.example"))
 	if err != nil {
@@ -99,11 +99,8 @@ func runDocker(t *testing.T, args ...string) {
 
 func runComposeConfig(t *testing.T, root, compose, envFile string) string {
 	t.Helper()
-	cmd := exec.Command("docker", "compose", "--project-directory", root, "--env-file", envFile, "-f", compose, "config")
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "COMPOSE_PROJECT_NAME=gramsrv-legacy-test"}
-	if runtime.GOOS == "windows" {
-		cmd.Env = append(cmd.Env, "SystemRoot="+os.Getenv("SystemRoot"))
-	}
+	cmd := exec.Command("docker", "compose", "--env-file", envFile, "-f", compose, "config")
+	cmd.Env = append(os.Environ(), "COMPOSE_PROJECT_NAME=gramsrv-legacy-test")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker compose config: %v\n%s", err, output)
@@ -111,11 +108,15 @@ func runComposeConfig(t *testing.T, root, compose, envFile string) string {
 	return string(output)
 }
 
-func mustAbs(t *testing.T, path string) string {
+func repositoryRoot(t *testing.T) string {
 	t.Helper()
-	abs, err := filepath.Abs(path)
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	root, err := filepath.Abs(filepath.Join(filepath.Dir(filename), ".."))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return abs
+	return root
 }
