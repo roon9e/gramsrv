@@ -160,6 +160,7 @@ test("language and notification preferences persist and broadcasts honor them", 
   assert.equal(await db.toggleNotifications(2), false);
   const afterToggle = await db.notificationRecipients();
   assert.deepEqual(afterToggle.map((u) => u.telegram_id), [1]);
+  assert.equal(await db.toggleNotifications(2), true);
   await db.pool.query("UPDATE users SET updated_at = 0 WHERE telegram_id = 1");
   const stale = await db.notificationRecipients(30);
   assert.deepEqual(stale.map((u) => u.telegram_id), [2]);
