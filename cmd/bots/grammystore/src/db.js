@@ -143,7 +143,7 @@ export class BotDatabase {
       if (current && current.format !== "free") throw new Error("account already has an active anonymous number");
       if (replace) {
         await client.query("DELETE FROM code_access WHERE phone IN (SELECT phone FROM numbers WHERE owner_id = $1 AND format = 'free')", [ownerID]);
-        await client.query("DELETE FROM numbers WHERE owner_id = $1 AND format = 'free'", [ownerID]);
+        await client.query("UPDATE numbers SET is_current = FALSE WHERE owner_id = $1 AND format = 'free'", [ownerID]);
       }
       for (let attempt = 0; attempt < 400; attempt++) {
         const generated = generatedNumber(format, country);

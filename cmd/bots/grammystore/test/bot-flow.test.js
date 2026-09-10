@@ -131,7 +131,7 @@ function fixture() {
       result: { message_id: 100, date: 1, chat: { id: payload.chat_id ?? 1, type: "private" }, text: payload.text ?? "" },
     };
   });
-  return { bot, calls, config, db };
+  return { bot, calls, config, db, gramsrv };
 }
 
 test("English language callback persists and redraws all settings controls in English", async () => {
@@ -214,4 +214,113 @@ test("real mode rejects random number generation", async () => {
   });
   const rejectMsg = calls.find((call) => call.method === "sendMessage" && (call.payload.text?.includes("недоступна") || call.payload.text?.includes("not available")));
   assert.ok(rejectMsg, "Real mode should reject random number generation");
+});
+
+function accountCallbackUpdate({ fromID = 10, chatID = 10, data, messageText = "Settings" }) {
+  return {
+    update_id: Date.now(),
+    callback_query: {
+      id: `cb-${fromID}`,
+      from: { id: fromID, is_bot: false, first_name: "User", language_code: "ru" },
+      chat_instance: "instance",
+      data,
+      message: { message_id: 1, date: 1, chat: { id: chatID, type: "private" }, text: messageText },
+    },
+  };
+}
+
+async function seedAccountUser(db, { serverUserID = 0, hasNumber = false, verifiedPhone = null } = {}) {
+  await db.upsertUser({ id: 10, first_name: "User", language_code: "ru" }, 10, "ru");
+  const user = await db.user(10);
+  user.server_user_id = serverUserID;
+  if (hasNumber) await db.createNumber(10, 10);
+  if (verifiedPhone) db.verifiedPhone = async () => ({ phone: verifiedPhone });
+  return user;
+}
+
+test("Account ID menu offers fetch and manual entry", async () => {
+  const { bot, calls, db } = fixture();
+  await seedAccountUser(db);
+  await bot.handleUpdate(accountCallbackUpdate({ data: "settings:account" }));
+  const edit = calls.find((call) => call.method === "editMessageText");
+  const labels = edit.payload.reply_markup.inline_keyboard.flat().map((button) => button.text).join("\n");
+  assert.match(labels, /Найти мой ID/);
+  assert.match(labels, /Ввести вручную/);
+});
+
+test("Account fetch resolves the current number and saves the server id", async () => {
+  const { bot, calls, db, gramsrv } = fixture();
+  await seedAccountUser(db, { hasNumber: true });
+  const resolveCalls = [];
+  gramsrv.resolveUserByPhone = async (phone) => { resolveCalls.push(phone); return 1780243207; };
+  await bot.handleUpdate(accountCallbackUpdate({ data: "settings:account:fetch" }));
+  assert.deepEqual(resolveCalls, ["+79990000001"]);
+  assert.equal((await db.user(10)).server_user_id, 1780243207);
+  const answer = calls.find((call) => call.method === "answerCallbackQuery");
+  assert.match(answer.payload.text, /1780243207/);
+});
+
+test("Account fetch uses the bound verified phone in real mode", async () => {
+  const { bot, calls, db, config, gramsrv } = fixture();
+  config.botMode = "real";
+  await seedAccountUser(db, { hasNumber: true, verifiedPhone: "+79991234567" });
+  const resolveCalls = [];
+  gramsrv.resolveUserByPhone = async (phone) => { resolveCalls.push(phone); return 1780243207; };
+  await bot.handleUpdate(accountCallbackUpdate({ data: "settings:account:fetch" }));
+  assert.deepEqual(resolveCalls, ["+79991234567"]);
+  assert.equal((await db.user(10)).server_user_id, 1780243207);
+  assert.match(calls.find((call) => call.method === "answerCallbackQuery").payload.text, /1780243207/);
+});
+
+test("Account fetch reports when no lookup number exists", async () => {
+  const { bot, calls, db, gramsrv } = fixture();
+  await seedAccountUser(db);
+  let resolveCalled = false;
+  gramsrv.resolveUserByPhone = async () => { resolveCalled = true; return 0; };
+  await bot.handleUpdate(accountCallbackUpdate({ data: "settings:account:fetch" }));
+  assert.equal(resolveCalled, false);
+  assert.match(calls.find((call) => call.method === "answerCallbackQuery").payload.text, /нет привязанного номера/);
+});
+
+test("Account fetch reports when the phone has no account", async () => {
+  const { bot, calls, db, gramsrv } = fixture();
+  await seedAccountUser(db, { hasNumber: true });
+  gramsrv.resolveUserByPhone = async () => 0;
+  await bot.handleUpdate(accountCallbackUpdate({ data: "settings:account:fetch" }));
+  assert.equal((await db.user(10)).server_user_id, 0);
+  assert.match(calls.find((call) => call.method === "answerCallbackQuery").payload.text, /не найден аккаунт/);
+});
+
+test("numbers menu hides the free number button after buying +888", async () => {
+  const { bot, calls, db } = fixture();
+  await db.upsertUser({ id: 10, first_name: "User", language_code: "ru" }, 10, "ru");
+  await db.createNumber(10, 10, "short", "ANON", true);
+  await bot.handleUpdate(accountCallbackUpdate({ data: "menu:numbers" }));
+  const edit = calls.find((call) => call.method === "editMessageText");
+  assert.ok(edit, "Random mode numbers menu should be editable");
+  const labels = edit.payload.reply_markup.inline_keyboard.flat().map((button) => button.text).join("\n");
+  assert.doesNotMatch(labels, /Новый бесплатный номер|New free number/);
+  assert.match(edit.payload.text, /бесплатный номер недоступен|free number is unavailable/i);
+});
+
+test("numbers menu still offers a free number for a user with no purchased number", async () => {
+  const { bot, calls, db } = fixture();
+  await db.upsertUser({ id: 10, first_name: "User", language_code: "ru" }, 10, "ru");
+  await db.createNumber(10, 10, "free", "RU", false);
+  await bot.handleUpdate(accountCallbackUpdate({ data: "menu:numbers" }));
+  const edit = calls.find((call) => call.method === "editMessageText");
+  const labels = edit.payload.reply_markup.inline_keyboard.flat().map((button) => button.text).join("\n");
+  assert.match(labels, /Новый бесплатный номер/);
+});
+
+test("requesting a new free number after buying +888 is refused", async () => {
+  const { bot, calls, db } = fixture();
+  await db.upsertUser({ id: 10, first_name: "User", language_code: "ru" }, 10, "ru");
+  await db.createNumber(10, 10, "short", "ANON", true);
+  await bot.handleUpdate(accountCallbackUpdate({ data: "numbers:new:RU" }));
+  const edit = calls.find((call) => call.method === "editMessageText");
+  assert.ok(edit, "Refusal should be shown in the message");
+  assert.match(edit.payload.text, /бесплатный номер недоступен|free number is unavailable/i);
+  const owned = await db.numbers(10);
+  assert.equal(owned.filter((n) => n.format === "free").length, 0);
 });

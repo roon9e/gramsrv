@@ -113,6 +113,13 @@ export function settingsKeyboard(language, user, config) {
   return kb;
 }
 
+export function accountKeyboard(language) {
+  return new InlineKeyboard()
+    .text(translate(language, "accountFetchButton"), "settings:account:fetch").row()
+    .text(translate(language, "accountEnterButton"), "settings:account:enter").row()
+    .text(translate(language, "back"), "menu:settings");
+}
+
 export function adminKeyboard(language) {
   return new InlineKeyboard()
     .text(translate(language, "adminStatsButton"), "admin:stats").text(translate(language, "adminLookupButton"), "admin:lookup").row()
@@ -393,8 +400,12 @@ export function createBot({ config, db, gramsrv }) {
       }
       const numbers = await db.numbers(ctx.from.id);
       const list = numbers.slice(0, 10).map((number) => `${number.is_current ? "▶️" : "▫️"} <code>${escapeHTML(number.display)}</code>`).join("\n");
-      const kb = new InlineKeyboard().text(tr(ctx.from.id, "newFreeNumber"), "numbers:new").row().text(tr(ctx.from.id, "back"), "menu:home");
-      return editOrReply(ctx, `${tr(ctx.from.id, "numbersTitle")}\n\n${list || "—"}`, kb);
+      const purchasedOwned = currentNumber && currentNumber.format !== "free";
+      const kb = new InlineKeyboard();
+      if (!purchasedOwned) kb.text(tr(ctx.from.id, "newFreeNumber"), "numbers:new").row();
+      kb.text(tr(ctx.from.id, "back"), "menu:home");
+      const note = purchasedOwned ? `\n\n${tr(ctx.from.id, "freeNumberUnavailable")}` : "";
+      return editOrReply(ctx, `${tr(ctx.from.id, "numbersTitle")}\n\n${list || "—"}${note}`, kb);
     }
     if (page === "shop") return editOrReply(ctx, tr(ctx.from.id, "shopTitle"), shopKeyboard(language));
     if (page === "bonuses") {
@@ -417,6 +428,9 @@ export function createBot({ config, db, gramsrv }) {
     await ctx.answerCallbackQuery();
     if (rejectRandomInRealMode(ctx, config, languageOf(ctx.from.id))) return;
     const language = languageOf(ctx.from.id);
+    if (await hasActiveAnonymousNumber(db, ctx.from.id)) {
+      return editOrReply(ctx, tr(ctx.from.id, "freeNumberUnavailable"), backKeyboard(language, "menu:numbers"));
+    }
     const kb = new InlineKeyboard().text(tr(ctx.from.id, "countryRU"), "numbers:new:RU").text(tr(ctx.from.id, "countryUS"), "numbers:new:US").row().text(tr(ctx.from.id, "back"), "menu:numbers");
     await editOrReply(ctx, tr(ctx.from.id, "chooseCountry"), kb);
   });
@@ -425,6 +439,9 @@ export function createBot({ config, db, gramsrv }) {
     await ctx.answerCallbackQuery();
     if (rejectRandomInRealMode(ctx, config, languageOf(ctx.from.id))) return;
     const language = languageOf(ctx.from.id);
+    if (await hasActiveAnonymousNumber(db, ctx.from.id)) {
+      return editOrReply(ctx, tr(ctx.from.id, "freeNumberUnavailable"), backKeyboard(language, "menu:numbers"));
+    }
     const number = await db.createNumber(ctx.from.id, ctx.chat.id, "free", ctx.match[1], true);
     const user = await db.user(ctx.from.id);
     await syncFreeNumber(gramsrv, user, number);
@@ -507,8 +524,49 @@ export function createBot({ config, db, gramsrv }) {
 
   bot.callbackQuery(/^settings:account$/, async (ctx) => {
     await ctx.answerCallbackQuery();
+    const user = await db.user(ctx.from.id);
+    const language = languageOf(ctx.from.id);
+    const title = user?.server_user_id
+      ? tr(ctx.from.id, "accountMenuID", { id: user.server_user_id })
+      : tr(ctx.from.id, "accountMenuTitle");
+    await editOrReply(ctx, title, accountKeyboard(language));
+  });
+
+  bot.callbackQuery(/^settings:account:enter$/, async (ctx) => {
+    await ctx.answerCallbackQuery();
     await db.setPending(ctx.from.id, "account");
-    await editOrReply(ctx, tr(ctx.from.id, "accountPrompt"), backKeyboard(languageOf(ctx.from.id), "menu:settings"));
+    await editOrReply(ctx, tr(ctx.from.id, "accountPrompt"), backKeyboard(languageOf(ctx.from.id), "settings:account"));
+  });
+
+  bot.callbackQuery(/^settings:account:fetch$/, async (ctx) => {
+    const language = languageOf(ctx.from.id);
+    try {
+      let phone = null;
+      if (isRealMode(config)) {
+        const verified = await db.verifiedPhone(ctx.from.id);
+        phone = verified?.phone ?? null;
+      }
+      if (!phone) {
+        const number = await db.currentNumber(ctx.from.id);
+        phone = number?.phone ?? null;
+      }
+      if (!phone) {
+        return ctx.answerCallbackQuery({ text: tr(ctx.from.id, "accountFetchNoPhone"), show_alert: true });
+      }
+      const serverUserID = await gramsrv.resolveUserByPhone(phone);
+      if (!serverUserID) {
+        return ctx.answerCallbackQuery({ text: tr(ctx.from.id, "accountFetchNotFound"), show_alert: true });
+      }
+      await db.setServerUserID(ctx.from.id, serverUserID);
+      await db.clearPending(ctx.from.id);
+      db._userCache.set(ctx.from.id, await db.user(ctx.from.id));
+      const message = tr(ctx.from.id, "accountSaved", { id: serverUserID });
+      await ctx.answerCallbackQuery({ text: message });
+      return editOrReply(ctx, message, mainKeyboard(language, isOwner(config, ctx.from.id)));
+    } catch (error) {
+      console.error("Account fetch failed", error);
+      return ctx.answerCallbackQuery({ text: translateError(language, error) });
+    }
   });
 
   bot.callbackQuery(/^settings:phone$/, async (ctx) => {

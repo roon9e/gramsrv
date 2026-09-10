@@ -2308,3 +2308,41 @@ func TestDeleteCollectibleUsernameCommand(t *testing.T) {
 		t.Fatalf("delete of invalid name = nil error, want rejection")
 	}
 }
+
+// --- UserLookup / ResolveUserByPhone ---
+
+type fakeUserLookup struct{ users []domain.User }
+
+func (f *fakeUserLookup) ByPhone(_ context.Context, phone string) (domain.User, bool, error) {
+	for _, u := range f.users {
+		if u.Phone == phone {
+			return u, true, nil
+		}
+	}
+	return domain.User{}, false, nil
+}
+
+func TestResolveUserByPhoneFindsAndNormalizes(t *testing.T) {
+	ctx := context.Background()
+	lookup := &fakeUserLookup{users: []domain.User{{ID: 1_780_243_207, Phone: "79991234567"}}}
+	svc := NewService(Dependencies{UserLookup: lookup})
+	u, found, err := svc.ResolveUserByPhone(ctx, "+7 999 123-45-67")
+	if err != nil || !found || u.ID != 1_780_243_207 {
+		t.Fatalf("resolve found=%v user=%+v err=%v", found, u, err)
+	}
+}
+
+func TestResolveUserByPhoneReturnsNotFoundWhenMissing(t *testing.T) {
+	ctx := context.Background()
+	svc := NewService(Dependencies{UserLookup: &fakeUserLookup{}})
+	if _, found, err := svc.ResolveUserByPhone(ctx, "+79990000000"); err != nil || found {
+		t.Fatalf("resolve missing found=%v err=%v", found, err)
+	}
+}
+
+func TestResolveUserByPhoneRejectsMissingDependency(t *testing.T) {
+	svc := NewService(Dependencies{})
+	if _, _, err := svc.ResolveUserByPhone(context.Background(), "+79991234567"); err == nil || !strings.Contains(err.Error(), "user lookup") {
+		t.Fatalf("without dependency err=%v", err)
+	}
+}

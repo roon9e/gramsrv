@@ -580,6 +580,51 @@ func TestOfficialStarGiftListItemExposesExplicitCapabilities(t *testing.T) {
 
 type fakeService struct{}
 
+type resolveByPhoneService struct {
+	fakeService
+	phone string
+	found bool
+	user  domain.User
+}
+
+func (s *resolveByPhoneService) ResolveUserByPhone(_ context.Context, phone string) (domain.User, bool, error) {
+	s.phone = phone
+	return s.user, s.found, nil
+}
+
+func TestAdminAPIResolveUserByPhone(t *testing.T) {
+	svc := &resolveByPhoneService{found: true, user: domain.User{ID: 1_780_243_207}}
+	srv := &Server{token: "secret", svc: svc}
+	req := httptest.NewRequest(http.MethodPost, "/v1/accounts/resolve-by-phone", strings.NewReader(`{"phone":"+79991234567"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if svc.phone != "+79991234567" {
+		t.Fatalf("decoded phone = %q", svc.phone)
+	}
+	if !strings.Contains(rec.Body.String(), `"found":true`) || !strings.Contains(rec.Body.String(), `"user_id":1780243207`) {
+		t.Fatalf("body=%s", rec.Body.String())
+	}
+}
+
+func TestAdminAPIResolveUserByPhoneNotFound(t *testing.T) {
+	svc := &resolveByPhoneService{}
+	srv := &Server{token: "secret", svc: svc}
+	req := httptest.NewRequest(http.MethodPost, "/v1/accounts/resolve-by-phone", strings.NewReader(`{"phone":"+79990000000"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"found":false`) {
+		t.Fatalf("body=%s", rec.Body.String())
+	}
+}
+
 type captureFreezeService struct {
 	fakeService
 	req admin.SetAccountFrozenRequest

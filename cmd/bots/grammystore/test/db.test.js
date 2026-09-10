@@ -188,6 +188,20 @@ test("one active number per user is enforced", async () => {
   assert.equal(old.rows[0].is_current, false);
 });
 
+test("a purchased number blocks obtaining a free number afterwards", async () => {
+  if (!db) return;
+  await cleanTable("numbers"); await cleanTable("users");
+  await db.upsertUser({ id: 11, first_name: "Buyer" }, 110, "ru");
+  const purchased = await db.createNumber(11, 110, "short", "ANON", true);
+  assert.equal(purchased.format, "short");
+  await assert.rejects(() => db.createNumber(11, 110, "free", "RU", true), /active anonymous number/);
+  const current = await db.currentNumber(11);
+  assert.equal(current.id, purchased.id);
+  assert.equal(current.is_current, true);
+  const freeNumbers = await db.pool.query("SELECT * FROM numbers WHERE owner_id = 11 AND format = 'free'");
+  assert.equal(freeNumbers.rowCount, 0);
+});
+
 test("verified phone binding and lookup", async () => {
   if (!db) return;
   await cleanTable("verified_phones"); await cleanTable("users");

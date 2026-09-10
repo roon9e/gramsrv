@@ -1639,6 +1639,7 @@ func run(logger *zap.Logger) error {
 		Auth:                   authService,
 		Revoker:                router,
 		Users:                  usersService,
+		UserLookup:             userStore,
 		Account:                accountService,
 		Photos:                 filesService,
 		Stars:                  starsService,
