@@ -1469,9 +1469,14 @@ func TestImportOfficialStarGiftPreservesCraftedRarityAndPublishesBundle(t *testi
 		t.Fatalf("imported models=%+v backdrops=%+v", models, gifts.lastBundle.Collectible.Backdrops)
 	}
 	catalog := gifts.lastBundle.Catalog
-	if catalog.Limited || catalog.SoldOut || catalog.AvailabilityTotal != 0 || catalog.AvailabilityRemains != 0 ||
+	// The operator's "Уникальный тираж" (supply_total) is derived from the snapshot's
+	// availability when absent, so a finite unique supply now limits the base gift to
+	// the same run size. Sold-out, resale, and sale-date state still does not leak.
+	if !catalog.Limited || catalog.SoldOut || catalog.AvailabilityTotal != 10 || catalog.AvailabilityRemains != 10 ||
 		catalog.AvailabilityResale != 0 || catalog.FirstSaleDate != 0 || catalog.LastSaleDate != 0 || catalog.ResellMinStars != 0 {
-		t.Fatalf("official global market state leaked into local catalog: %+v", catalog)
+		t.Fatalf("unexpected local catalog state: limited=%v sold_out=%v total=%d remains=%d resale=%d first=%d last=%d resell_min=%d",
+			catalog.Limited, catalog.SoldOut, catalog.AvailabilityTotal, catalog.AvailabilityRemains,
+			catalog.AvailabilityResale, catalog.FirstSaleDate, catalog.LastSaleDate, catalog.ResellMinStars)
 	}
 	if catalog.OfficialGiftID != source.bundle.Gift.ID || !bytes.Equal(catalog.OfficialSourceJSON, source.bundle.SourceJSON) ||
 		!bytes.Equal(catalog.SourceManifestSHA256, source.bundle.ManifestSHA256) {

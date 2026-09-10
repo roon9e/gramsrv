@@ -264,6 +264,7 @@ body always contains the **common command fields** (`command_id`, `reason`,
 | `grant-premium` | `user_id` (int64), `months` (int) | `premium.manage` |
 | `upsert-premium-plan` | `months` (int), `duration_days` (int), `amount_stars` (int64), `fiat_currency` (string), `fiat_amount` (int64), `store_product` (string), `store_quantity` (int), `enabled` (bool), `sort_order` (int), `label` (string), `expected_version` (int64) | `premium.manage` |
 | `grant-stars` | `user_id` (int64), `amount` (int64) | — |
+| `debit-stars` | `user_id` (int64), `amount` (int64, 1..1000000000); insufficient balance rejects the debit | — |
 | `set-verified` | `user_id` (int64), `verified` (bool) | — |
 | `set-account-flags` | `user_id` (int64), `scam` (bool), `fake` (bool) | — |
 | `set-support` | `user_id` (int64), `support` (bool) | — |
@@ -363,6 +364,23 @@ X-CSRF-Token: <csrf from /api/session>
 | `transfer-collectible-phone` | `phone` (string), `to_user_id` (int64) | — |
 | `revoke-collectible-phone` | `phone` (string), `burn` (bool) | — |
 | `delete-collectible-phone` | `phone` (string) | — |
+
+## Gift inventory when importing or replacing a revision
+
+For a new official gift, enabling `include_collectible` uses `supply_total` as
+both the unique-gift supply and the base gift's initial sales cap. If omitted,
+the collectible supply is derived from the snapshot's availability or upgrade
+variants. With collectible import disabled, this input does not limit ordinary
+base gifts. Auctions still require their own finite supply.
+
+An existing `gift_id` keeps its original base supply, limited flag, remaining
+stock, resale counters and sale dates. Replacement never replenishes exhausted
+stock or converts it to unlimited. A different base cap or auction/non-auction
+mode requires a new gift identity; requesting it on an existing identity fails
+without publishing either revision. The separate collectible-pool editor does
+not change base stock. Inventory is rechecked under the purchase/catalog lock
+at execution, and the result reports the committed remaining stock. Dry-run
+does not reserve stock. The catalog badge shows remaining / total copies.
 
 ## API: account rating actions
 

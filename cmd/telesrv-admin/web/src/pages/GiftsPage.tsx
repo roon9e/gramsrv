@@ -245,7 +245,7 @@ export function GiftsPage() {
 		source_gift_id: sourceGiftID, gift_id: giftID, title: title.trim(),
 		stars, convert_stars: convertStars, enabled, sort_order: Number(sortOrder),
 		include_collectible: includeCollectible, upgrade_stars: upgradeStars,
-      supply_total: Number(supplyTotal), slug_prefix: slugPrefix.trim().toLowerCase(),
+      supply_total: includeCollectible ? Number(supplyTotal) : 0, slug_prefix: slugPrefix.trim().toLowerCase(),
       locked_until_date: lockedUntil
     };
   }
@@ -257,7 +257,7 @@ export function GiftsPage() {
     setConvertStars(String(gift.convert_stars));
     setIncludeCollectible(gift.can_upgrade);
 		setUpgradeStars(gift.upgrade_stars);
-		setSupplyTotal(String(gift.availability_total > 0 ? gift.availability_total : Math.max(gift.upgrade_variants, 1)));
+    setSupplyTotal(String(gift.can_upgrade ? (gift.availability_total > 0 ? gift.availability_total : Math.max(gift.upgrade_variants, 1)) : 0));
     setSlugPrefix(`official-${gift.source_gift_id}`);
     setPreview(null);
   }
@@ -325,7 +325,7 @@ export function GiftsPage() {
                 <td><LottiePreview giftID={gift.GiftID} revision={gift.Revision} compact /></td>
                 <td className="mono">{gift.GiftID} / {gift.Revision}</td>
                 <td><strong className="gift-table-title">{gift.Title || `Gift #${gift.GiftID}`}</strong><span className="gift-sort-order">{t("gifts.sortOrder")}: {gift.SortOrder}</span></td>
-                <td><strong className="gift-table-price">⭐ {gift.Stars}</strong><span className="gift-convert-price">→ {gift.ConvertStars}</span></td>
+                <td><strong className="gift-table-price">⭐ {gift.Stars}</strong><span className="gift-convert-price">→ {gift.ConvertStars}</span>{gift.Limited && <span className="gift-limited-badge">{t("gifts.limited.badge", { remains: gift.AvailabilityRemains, total: gift.AvailabilityTotal })}</span>}</td>
                 <td><Badge>{gift.SourceFormat}</Badge><span className="gift-source-size">{formatBytes(gift.AnimationSize)}</span></td>
                 <td>{gift.ReceivedCount}</td>
                 <td><Badge tone={gift.Enabled ? "good" : "neutral"}>{gift.Enabled ? t("common.enabled") : t("common.disabled")}</Badge></td>
@@ -401,6 +401,7 @@ export function GiftsPage() {
                     <label><span>{t("collectibles.supply")}</span><input type="number" min="1" value={supplyTotal} onChange={(e) => { setSupplyTotal(e.target.value); setPreview(null); }} /></label>
                     <label><span>{t("collectibles.slug")}</span><input value={slugPrefix} maxLength={48} onChange={(e) => { setSlugPrefix(e.target.value.toLowerCase()); setPreview(null); }} /></label>
                   </div>}
+                  {includeCollectible && <div className="gift-import-note"><span>{t("gifts.officialSupplyHint")}</span></div>}
                 </>}
               </section> : <>
                 <div className="gift-import-note"><span>{t("gifts.importHint")}</span><div className="gift-format-chips" aria-label={t("gifts.formats")}><span>TGS</span><span>Lottie JSON</span></div></div>

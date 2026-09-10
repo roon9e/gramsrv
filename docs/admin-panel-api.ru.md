@@ -277,6 +277,7 @@ PostgreSQL, решения — всегда через Admin API (журнал �
 | `grant-premium` | `user_id` (int64), `months` (int) | `premium.manage` |
 | `upsert-premium-plan` | `months` (int), `duration_days` (int), `amount_stars` (int64), `fiat_currency` (string), `fiat_amount` (int64), `store_product` (string), `store_quantity` (int), `enabled` (bool), `sort_order` (int), `label` (string), `expected_version` (int64) | `premium.manage` |
 | `grant-stars` | `user_id` (int64), `amount` (int64) | — |
+| `debit-stars` | `user_id` (int64), `amount` (int64, 1..1000000000); при недостаточном балансе списание отклоняется | — |
 | `set-verified` | `user_id` (int64), `verified` (bool) | — |
 | `set-account-flags` | `user_id` (int64), `scam` (bool), `fake` (bool) | — |
 | `set-support` | `user_id` (int64), `support` (bool) | — |

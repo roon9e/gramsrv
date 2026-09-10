@@ -215,13 +215,24 @@ INSERT INTO star_gift_catalog (
 				return fmt.Errorf("insert star gift catalog: %w", err)
 			}
 		} else {
-			var ignored int64
+			current := domain.StarGift{ID: giftID}
 			if err := tx.QueryRow(ctx, `
-SELECT active_revision_id FROM star_gift_catalog WHERE gift_id=$1 FOR UPDATE`, giftID).Scan(&ignored); err != nil {
+SELECT r.limited, r.sold_out, r.auction, r.availability_total,
+       c.availability_remains, c.availability_resale, c.resell_min_stars,
+       c.first_sale_date, c.last_sale_date
+FROM star_gift_catalog c
+JOIN star_gift_catalog_revisions r ON r.id=c.active_revision_id
+WHERE c.gift_id=$1 FOR UPDATE OF c`, giftID).Scan(
+				&current.Limited, &current.SoldOut, &current.Auction, &current.AvailabilityTotal,
+				&current.AvailabilityRemains, &current.AvailabilityResale, &current.ResellMinStars,
+				&current.FirstSaleDate, &current.LastSaleDate); err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
 					return domain.ErrStarGiftNotFound
 				}
 				return fmt.Errorf("lock star gift catalog: %w", err)
+			}
+			if err := write.PreserveCatalogInventory(current); err != nil {
+				return err
 			}
 			if err := tx.QueryRow(ctx, `
 SELECT COALESCE(MAX(revision), 0) + 1

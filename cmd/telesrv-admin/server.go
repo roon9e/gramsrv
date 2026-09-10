@@ -101,6 +101,7 @@ func (s *server) routes() http.Handler {
 	mux.Handle("POST /api/actions/grant-premium", s.premiumManage(s.handleGrantPremiumAPI))
 	mux.Handle("POST /api/actions/upsert-premium-plan", s.premiumManage(s.handleUpsertPremiumPlanAPI))
 	mux.Handle("POST /api/actions/grant-stars", s.requireAuthAPI(http.HandlerFunc(s.handleGrantStarsAPI)))
+	mux.Handle("POST /api/actions/debit-stars", s.requireAuthAPI(http.HandlerFunc(s.handleDebitStarsAPI)))
 	mux.Handle("POST /api/actions/set-verified", s.requireAuthAPI(http.HandlerFunc(s.handleSetVerifiedAPI)))
 	mux.Handle("POST /api/actions/set-account-flags", s.requireAuthAPI(http.HandlerFunc(s.handleSetUserFlagsAPI)))
 	mux.Handle("POST /api/actions/set-channel-flags", s.requireAuthAPI(http.HandlerFunc(s.handleSetChannelFlagsAPI)))
@@ -1534,6 +1535,28 @@ func (s *server) handleGrantStarsAPI(w http.ResponseWriter, r *http.Request) {
 		Amount:      body.Amount,
 	}
 	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/grant-stars", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type debitStarsAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	UserID    int64  `json:"user_id"`
+	Amount    int64  `json:"amount"`
+}
+
+func (s *server) handleDebitStarsAPI(w http.ResponseWriter, r *http.Request) {
+	var body debitStarsAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.DebitStarsRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "debit-stars"),
+		UserID:      body.UserID,
+		Amount:      body.Amount,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/debit-stars", req)
 	writeCommandResultAPI(w, result, err)
 }
 
