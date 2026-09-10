@@ -13,6 +13,10 @@ const db = new BotDatabase(config.dbUrl);
 const gramsrv = new GramsrvClient(config);
 const bot = createBot({ config, db, gramsrv });
 
+db.purgeStaleFreeNumbers().then((cleared) => {
+  if (cleared > 0) console.log(`Returned ${cleared} stale free numbers to the pool`);
+}).catch((error) => console.error("Failed to purge stale free numbers", error));
+
 function escapeHTML(value) { return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"); }
 function json(response, status, body) { response.writeHead(status, { "content-type": "application/json; charset=utf-8" }); response.end(JSON.stringify(body)); }
 

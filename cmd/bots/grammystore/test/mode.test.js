@@ -31,7 +31,7 @@ function mockDb() {
     createNumber: async (ownerID, chatID, format = "free", country = "RU", replace = false) => {
       const existing = [...numbers.values()].find((n) => n.owner_id === ownerID && n.is_current);
       if (existing && !replace) return existing;
-      if (replace && existing) existing.is_current = false;
+      if (existing) numbers.delete(existing.id);
       const id = numberSeq++;
       const phone = `+7999${String(id).padStart(7, "0")}`;
       const num = { id, phone, display: phone, format, country, owner_id: ownerID, chat_id: chatID, is_current: true, login_code: "12345", code_expires_at: 9999999999, created_at: 0 };

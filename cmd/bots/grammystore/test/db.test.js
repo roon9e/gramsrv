@@ -132,16 +132,17 @@ test("code access, support replies, refunds and pending wheel awards are durable
   await assert.rejects(() => db.reserveSpin(1, 100, 50));
 });
 
-test("refunding a paid number removes it and restores the persistent free number", async () => {
+test("refunding a paid number removes it and leaves no stored number behind", async () => {
   if (!db) return;
   await cleanTable("numbers"); await cleanTable("users");
   await db.upsertUser({ id: 5, first_name: "Buyer" }, 50, "ru");
   const free = await db.createNumber(5, 50, "free", "RU", false);
   const paid = await db.createNumber(5, 50, "short", "ANON", true);
+  assert.equal(await db.findNumber(free.phone), null, "old free number returned to the pool on purchase");
   assert.equal(await db.revokePurchasedNumber(5, paid.id, paid.phone), true);
   assert.equal(await db.revokePurchasedNumber(5, paid.id, paid.phone), false);
   const current = await db.currentNumber(5);
-  assert.equal(current.id, free.id);
+  assert.equal(current, null, "after refund the user has no stored number");
   assert.equal(await db.findNumber(paid.phone), null);
 });
 
@@ -175,7 +176,7 @@ test("administrator mutations reject invalid input and missing users", async () 
   await assert.rejects(() => db.addBonus(999, 10));
 });
 
-test("one active number per user is enforced", async () => {
+test("issuing a new number returns the old one to the pool", async () => {
   if (!db) return;
   await cleanTable("numbers"); await cleanTable("users");
   await db.upsertUser({ id: 10, first_name: "Multi" }, 100, "ru");
@@ -184,8 +185,13 @@ test("one active number per user is enforced", async () => {
   const second = await db.createNumber(10, 100, "free", "RU", true);
   assert.equal(second.is_current, true);
   assert.notEqual(first.id, second.id);
-  const old = await db.pool.query("SELECT is_current FROM numbers WHERE id = $1", [first.id]);
-  assert.equal(old.rows[0].is_current, false);
+  const all = await db.numbers(10);
+  assert.equal(all.length, 1, "old number is not stored");
+  assert.equal(all[0].id, second.id);
+  assert.equal(await db.findNumber(first.phone), null, "old number returned to the pool");
+  const delivery = await db.updateLoginCode(first.phone, "00000");
+  assert.equal(delivery.number, null, "codes no longer attach to the replaced number");
+  assert.deepEqual(delivery.chatIDs, []);
 });
 
 test("a purchased number blocks obtaining a free number afterwards", async () => {

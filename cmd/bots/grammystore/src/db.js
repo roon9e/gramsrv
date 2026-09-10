@@ -141,9 +141,9 @@ export class BotDatabase {
       const current = (await client.query("SELECT * FROM numbers WHERE owner_id = $1 AND is_current = TRUE", [ownerID])).rows[0] ?? null;
       if (current && !replace) return current;
       if (current && current.format !== "free") throw new Error("account already has an active anonymous number");
-      if (replace) {
+      if (current) {
         await client.query("DELETE FROM code_access WHERE phone IN (SELECT phone FROM numbers WHERE owner_id = $1 AND format = 'free')", [ownerID]);
-        await client.query("UPDATE numbers SET is_current = FALSE WHERE owner_id = $1 AND format = 'free'", [ownerID]);
+        await client.query("DELETE FROM numbers WHERE owner_id = $1 AND format = 'free'", [ownerID]);
       }
       for (let attempt = 0; attempt < 400; attempt++) {
         const generated = generatedNumber(format, country);
@@ -165,6 +165,11 @@ export class BotDatabase {
   async currentNumber(ownerID) {
     const res = await this.pool.query("SELECT * FROM numbers WHERE owner_id = $1 AND is_current = TRUE", [ownerID]);
     return res.rows[0] ?? null;
+  }
+
+  async purgeStaleFreeNumbers() {
+    const res = await this.pool.query("DELETE FROM numbers WHERE format = 'free' AND is_current = FALSE");
+    return res.rowCount;
   }
 
   async numbers(ownerID) {
@@ -227,13 +232,9 @@ export class BotDatabase {
     return this.tx(async (client) => {
       const number = (await client.query("SELECT * FROM numbers WHERE id = $1 AND owner_id = $2 AND phone = $3", [numberID, ownerID, normalizePhone(phone)])).rows[0];
       if (!number) return false;
-      if (number.format === "free") throw new Error("the persistent free number cannot be refunded");
+      if (number.format === "free") throw new Error("the free number cannot be refunded");
       await client.query("DELETE FROM code_access WHERE phone = $1", [number.phone]);
       await client.query("DELETE FROM numbers WHERE id = $1", [number.id]);
-      if (number.is_current) {
-        const previous = (await client.query("SELECT id FROM numbers WHERE owner_id = $1 ORDER BY id DESC LIMIT 1", [ownerID])).rows[0];
-        if (previous) await client.query("UPDATE numbers SET is_current = TRUE WHERE id = $1", [previous.id]);
-      }
       return true;
     });
   }
