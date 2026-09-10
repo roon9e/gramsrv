@@ -3543,6 +3543,7 @@ func (s *Service) ImportStarGift(ctx context.Context, req ImportStarGiftRequest)
 		return CommandResult{}, domain.ErrStarGiftInvalid
 	}
 	lifecycle := domain.StarGiftCatalogWrite{
+		GiftID:  req.GiftID,
 		Auction: req.Auction, AuctionSlug: strings.TrimSpace(req.AuctionSlug), GiftsPerRound: req.GiftsPerRound,
 		AuctionStartDate: req.AuctionStartDate, AuctionRoundDuration: req.AuctionRoundDuration,
 		AvailabilityTotal: req.AvailabilityTotal, LockedUntilDate: req.LockedUntilDate,
@@ -3691,12 +3692,9 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 		lockedUntilDate = req.LockedUntilDate
 	}
 
-	// Supply for an auction import. The rule below — publish a snapshot as a fresh
-	// local entry with no inventory — cannot hold for an auction, because
-	// star_gift_catalog_revision_auction_check requires an auction to be limited and
-	// the supply check then requires availability_total > 0. Leaving both zero made
-	// every official auction import fail on the INSERT. Carry the snapshot's supply
-	// for that case only, and let the shared normalizer derive the rest.
+	// Auctions require finite inventory. For ordinary gifts, collectible supply
+	// limits a new base gift only when the operator imports that pool. A hidden,
+	// inactive collectible input must never cap a basic gift's sales.
 	limited, availabilityTotal := false, 0
 	if bundle.Gift.Auction {
 		limited, availabilityTotal = true, bundle.Gift.AvailabilityTotal
@@ -3704,11 +3702,7 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 			availabilityTotal = req.SupplyTotal
 		}
 	}
-	// The operator's "Уникальный тираж" (supply_total) also limits the base gift:
-	// a finite unique supply is published as the same-size limited-edition run of
-	// purchasable copies. NormalizeLifecycleAuthoring then flips Limited and seeds
-	// availability_remains for the one supply CHECK both facts must satisfy.
-	if req.SupplyTotal > 0 && !limited {
+	if req.IncludeCollectible && req.SupplyTotal > 0 && !limited {
 		limited, availabilityTotal = true, req.SupplyTotal
 	}
 
@@ -3798,8 +3792,8 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 		// The snapshot describes Telegram's global market, not this deployment's
 		// inventory. Keep the complete source JSON as provenance, while publishing
 		// regular official imports as a fresh, locally purchasable catalog entry.
-		// Local resale counters and sale dates are derived by lifecycle writes.
-		// Auctions are the one exception; see limited above.
+		// Base supply is selected above; resale counters and sale dates come from
+		// local lifecycle writes. Existing inventory is preserved under the store lock.
 		Limited: limited, SoldOut: false, Birthday: bundle.Gift.Birthday,
 		RequirePremium: bundle.Gift.RequirePremium, LimitedPerUser: bundle.Gift.LimitedPerUser,
 		PeerColorAvailable: bundle.Gift.PeerColorAvailable, Auction: bundle.Gift.Auction,
@@ -3811,8 +3805,8 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 		AuctionStartDate: bundle.Gift.AuctionStartDate, UpgradeVariants: bundle.Gift.UpgradeVariants,
 		Background: background,
 	}, Collectible: collectible}
-	// Only auctions are touched: a snapshot auction_start_date may be zero or in the
-	// past, and the revision's CHECK requires it to be positive. The full
+	// Seed only new finite identities; also resolve a zero auction_start_date.
+	// Existing inventory is resolved by the store under its write lock. The full
 	// ValidateLifecycleAuthoring is deliberately not run here — it is the authoring
 	// contract for operator input, and a snapshot legitimately carries a
 	// locked_until_date that has already elapsed.
@@ -3837,7 +3831,9 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 			details["auction_availability_total"] = write.Catalog.AvailabilityTotal
 			details["auction_start_date"] = write.Catalog.AuctionStartDate
 		}
-		if write.Catalog.Limited {
+		if req.GiftID != 0 {
+			details["inventory_policy"] = "preserve existing supply and remaining stock; rechecked at execution"
+		} else if write.Catalog.Limited {
 			details["limited"] = write.Catalog.Limited
 			details["availability_total"] = write.Catalog.AvailabilityTotal
 			details["availability_remains"] = write.Catalog.AvailabilityRemains
@@ -3863,6 +3859,9 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 		}
 		details["gift_id"] = strconv.FormatInt(result.Catalog.Gift.ID, 10)
 		details["catalog_revision_id"] = strconv.FormatInt(result.Catalog.Gift.RevisionID, 10)
+		details["limited"] = result.Catalog.Gift.Limited
+		details["availability_total"] = result.Catalog.Gift.AvailabilityTotal
+		details["availability_remains"] = result.Catalog.Gift.AvailabilityRemains
 		if result.Collectible != nil {
 			details["collectible_revision_id"] = strconv.FormatInt(result.Collectible.ID, 10)
 			details["collectible_revision"] = result.Collectible.Revision
