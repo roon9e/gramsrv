@@ -128,6 +128,7 @@ export function adminKeyboard(language) {
     .text(translate(language, "adminBonusButton"), "admin:bonus").text(translate(language, "adminInvoiceButton"), "admin:invoice").row()
     .text(translate(language, "adminAccessButton"), "admin:access").text(translate(language, "adminRefundButton"), "admin:refund").row()
     .text(translate(language, "adminReplyButton"), "admin:reply").text(translate(language, "adminRateButton"), "admin:rate").row()
+    .text(translate(language, "adminBindPhoneButton"), "admin:bindphone").row()
     .text(translate(language, "back"), "menu:home");
 }
 
@@ -219,6 +220,11 @@ export function createBot({ config, db, gramsrv }) {
   const languageOf = (id) => normalizeLanguage(db._userCache?.get(id)?.language, config.defaultLanguage);
   const tr = (id, key, variables = {}) => translate(languageOf(id), key, { product: escapeHTML(config.productName), ...variables });
   const localized = (id, product) => localizeProduct(product, languageOf(id));
+  const phoneShareMessages = new Map();
+
+  function deleteAfter(chatID, messageID, delayMs = 30_000) {
+    if (chatID > 0 && messageID) setTimeout(() => bot.api.deleteMessage(chatID, messageID).catch(() => {}), delayMs).unref?.();
+  }
 
   async function numbersMenu(ctx) {
     const currentNumber = await db.currentNumber(ctx.from.id);
@@ -227,7 +233,9 @@ export function createBot({ config, db, gramsrv }) {
       const language = languageOf(ctx.from.id);
       if (!bound && !currentNumber) {
         const { phoneShareKeyboard } = await import("./real-number.js");
-        return ctx.reply(`${tr(ctx.from.id, "phoneTitle")}\n\n${tr(ctx.from.id, "phoneIntro")}`, { parse_mode: "HTML", reply_markup: phoneShareKeyboard(language) });
+        const sent = await ctx.reply(`${tr(ctx.from.id, "phoneTitle")}\n\n${tr(ctx.from.id, "phoneIntro")}`, { parse_mode: "HTML", reply_markup: phoneShareKeyboard(language) });
+        phoneShareMessages.set(ctx.chat.id, sent.message_id);
+        return sent;
       }
       const lines = [tr(ctx.from.id, "numbersTitle")];
       if (bound) lines.push(tr(ctx.from.id, "phoneStatus", { phone: escapeHTML(bound.phone) }));
@@ -347,15 +355,19 @@ export function createBot({ config, db, gramsrv }) {
       fulfillment = { kind: "username", recipientID, username, bid: product.bid };
     } else if (product.kind === KINDS.number) {
       number = await db.createNumber(buyer.id, chatID, product.numberFormat, "ANON", true);
+      const user = await db.user(buyer.id);
+      await syncFreeNumber(gramsrv, user, number);
+      await db.unbindVerifiedPhone(buyer.id);
       recipientID = buyer.id;
       fulfillment = { kind: "number", ownerID: buyer.id, numberID: number.id, phone: number.phone, format: number.format };
     } else throw new Error("unknown product kind");
     const productView = localized(buyer.id, product);
     await db.addSale({ product: product.code, title: productView.title, starsPrice: product.starsPrice, recipientID, buyerID: buyer.id, buyerName: userName(buyer), chargeID, fulfillment });
     const message = number
-      ? tr(buyer.id, "numberReserved", { phone: escapeHTML(number.display) })
+      ? tr(buyer.id, isRealMode(config) ? "numberChanged" : "numberReserved", { phone: escapeHTML(number.display) })
       : tr(buyer.id, "productGranted", { title: escapeHTML(productView.title), id: recipientID });
-    await bot.api.sendMessage(chatID, message, { parse_mode: "HTML" }).catch(() => {});
+    const sent = await bot.api.sendMessage(chatID, message, { parse_mode: "HTML" }).catch(() => null);
+    if (chatID > 0 && sent) deleteAfter(chatID, sent.message_id);
   }
 
   bot.on("message:successful_payment", async (ctx) => {
@@ -562,7 +574,10 @@ export function createBot({ config, db, gramsrv }) {
       return editOrReply(ctx, message, mainKeyboard(language, isOwner(config, ctx.from.id)));
     } catch (error) {
       console.error("Account fetch failed", error);
-      return ctx.answerCallbackQuery({ text: translateError(language, error) });
+      const text = String(error?.message ?? "").startsWith("gramsrv ")
+        ? tr(ctx.from.id, "accountFetchFailed")
+        : translateError(language, error);
+      return ctx.answerCallbackQuery({ text, show_alert: true });
     }
   });
 
@@ -573,7 +588,9 @@ export function createBot({ config, db, gramsrv }) {
     const language = languageOf(ctx.from.id);
     if (!bound) {
       const { phoneShareKeyboard } = await import("./real-number.js");
-      return ctx.reply(`${tr(ctx.from.id, "phoneTitle")}\n\n${tr(ctx.from.id, "phoneIntro")}`, { parse_mode: "HTML", reply_markup: phoneShareKeyboard(language) });
+      const sent = await ctx.reply(`${tr(ctx.from.id, "phoneTitle")}\n\n${tr(ctx.from.id, "phoneIntro")}`, { parse_mode: "HTML", reply_markup: phoneShareKeyboard(language) });
+      phoneShareMessages.set(ctx.chat.id, sent.message_id);
+      return sent;
     }
     const kb = new InlineKeyboard().text(tr(ctx.from.id, "phoneUnbindButton"), "phone:unbind").row().text(tr(ctx.from.id, "back"), "menu:home");
     await editOrReply(ctx, `${tr(ctx.from.id, "phoneTitle")}\n\n${tr(ctx.from.id, "phoneStatus", { phone: escapeHTML(bound.phone) })}`, kb);
@@ -589,12 +606,17 @@ export function createBot({ config, db, gramsrv }) {
   bot.on("message:contact", async (ctx) => {
     if (!isRealMode(config)) return;
     const language = languageOf(ctx.from.id);
+    const shareMsgID = phoneShareMessages.get(ctx.chat.id);
+    if (shareMsgID) { phoneShareMessages.delete(ctx.chat.id); ctx.api.deleteMessage(ctx.chat.id, shareMsgID).catch(() => {}); }
+    ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
     try {
       if (ctx.message.contact.user_id !== ctx.from.id) throw new Error("errorContactNotOwn");
       const bound = await db.bindVerifiedPhone(ctx.from.id, ctx.chat.id, ctx.message.contact.phone_number);
-      await ctx.reply(tr(ctx.from.id, "phoneBound", { phone: escapeHTML(bound.phone) }), { parse_mode: "HTML", reply_markup: mainKeyboard(language, isOwner(config, ctx.from.id)) });
+      const sent = await ctx.reply(tr(ctx.from.id, "phoneBound", { phone: escapeHTML(bound.phone) }), { parse_mode: "HTML" });
+      deleteAfter(ctx.chat.id, sent.message_id);
+      return ctx.reply(tr(ctx.from.id, "menuTitle"), { reply_markup: mainKeyboard(language, isOwner(config, ctx.from.id)) });
     } catch (error) {
-      await ctx.reply(translateError(language, error), { reply_markup: { remove_keyboard: true } });
+      await ctx.reply(translateError(language, error), { reply_markup: mainKeyboard(language, isOwner(config, ctx.from.id)) });
     }
   });
 
@@ -658,7 +680,7 @@ export function createBot({ config, db, gramsrv }) {
     const promptKeys = {
       broadcast: "adminPromptBroadcast", stars: "adminPromptStars", premium: "adminPromptPremium", promo: "adminPromptPromo",
       giveaway: "adminPromptGiveaway", bonus: "adminPromptBonus", invoice: "adminPromptInvoice", access: "adminPromptAccess",
-      refund: "adminPromptRefund", reply: "adminPromptReply", rate: "adminPromptRate",
+      refund: "adminPromptRefund", reply: "adminPromptReply", rate: "adminPromptRate", bindphone: "adminPromptBindPhone",
     };
     if (promptKeys[action]) {
       await db.setPending(ctx.from.id, `admin_${action}`, { operationID: `admin:${ctx.from.id}:${Date.now()}:${randomInt(1_000_000)}` });
@@ -668,10 +690,41 @@ export function createBot({ config, db, gramsrv }) {
 
   bot.on("message:text", async (ctx) => {
     if (ctx.message.text.startsWith("/")) return;
+    const language = languageOf(ctx.from.id);
+    const input = ctx.message.text.trim();
+
+    if (input === translate(language, "phoneCancelButton")) {
+      const shareMsgID = phoneShareMessages.get(ctx.chat.id);
+      if (shareMsgID) { phoneShareMessages.delete(ctx.chat.id); ctx.api.deleteMessage(ctx.chat.id, shareMsgID).catch(() => {}); }
+      return ctx.reply(tr(ctx.from.id, "menuTitle"), { reply_markup: mainKeyboard(language, isOwner(config, ctx.from.id)) });
+    }
+
+    if (isOwner(config, ctx.from.id) && ctx.message.reply_to_message?.from?.id === (bot.botInfo?.id ?? 0)) {
+      const ticketMatch = ctx.message.reply_to_message.text?.match(/#(\d+)/);
+      if (ticketMatch) {
+        const ticketID = Number(ticketMatch[1]);
+        const ticket = await db.supportMessage(ticketID);
+        if (ticket?.status === "open") {
+          if (!input) return ctx.reply(tr(ctx.from.id, "errorEmptyReply"));
+          await bot.api.sendMessage(ticket.telegram_id, tr(ticket.telegram_id, "supportReply", { ticket: ticketID, answer: escapeHTML(input) }), { parse_mode: "HTML" });
+          await db.closeSupportMessage(ticketID);
+          return ctx.reply(tr(ctx.from.id, "supportReplySent", { ticket: ticketID }), { reply_markup: adminKeyboard(language) });
+        }
+      }
+    }
+
     const pending = await db.pending(ctx.from.id);
     if (!pending) return;
-    const input = ctx.message.text.trim();
-    const language = languageOf(ctx.from.id);
+    const adminResult = async (text, extra = {}) => {
+      const sent = await ctx.reply(text, { parse_mode: "HTML", reply_markup: adminKeyboard(language), ...extra });
+      if (sent?.message_id) deleteAfter(ctx.chat.id, sent.message_id);
+      return sent;
+    };
+    const toast = async (text, extra = {}) => {
+      const sent = await ctx.reply(text, { parse_mode: "HTML", ...extra });
+      if (sent?.message_id) deleteAfter(ctx.chat.id, sent.message_id);
+      return sent;
+    };
     try {
       if (pending.kind === "account") {
         const id = Number(input);
@@ -717,14 +770,14 @@ export function createBot({ config, db, gramsrv }) {
           const message = `${tr(owner, "supportOwnerTicket", { ticket })}\n${tr(owner, "supportOwnerFrom", { name: escapeHTML(userName(ctx.from)), id: ctx.from.id })}\n\n${escapeHTML(input)}`;
           await bot.api.sendMessage(owner, message, { parse_mode: "HTML" }).catch(() => {});
         }
-        return ctx.reply(tr(ctx.from.id, "supportTicketSent", { ticket }));
+        return toast(tr(ctx.from.id, "supportTicketSent", { ticket }));
       }
       if (!isOwner(config, ctx.from.id)) return;
       if (pending.kind === "admin_lookup") {
         await db.clearPending(ctx.from.id);
         const isPhone = /^\+/.test(input);
         const result = isPhone ? await db.adminLookupByNumber(input) : await db.adminLookupByTelegramID(Number(input));
-        if (!result) return ctx.reply(tr(ctx.from.id, "adminLookupNotFound"));
+        if (!result) return adminResult(tr(ctx.from.id, "adminLookupNotFound"));
         const lines = [];
         if (result.user) {
           const u = result.user;
@@ -740,7 +793,7 @@ export function createBot({ config, db, gramsrv }) {
         if (result.verifiedPhone) {
           lines.push(`📞 <b>Verified phone</b>: <code>${escapeHTML(result.verifiedPhone.phone)}</code>`);
         }
-        return ctx.reply(tr(ctx.from.id, "adminLookupResult", { result: lines.join("\n") }), { parse_mode: "HTML" });
+        return adminResult(tr(ctx.from.id, "adminLookupResult", { result: lines.join("\n") }));
       }
       if (pending.kind === "admin_broadcast") {
         await db.clearPending(ctx.from.id);
@@ -751,36 +804,36 @@ export function createBot({ config, db, gramsrv }) {
         for (const user of recipients) {
           try { await bot.api.sendMessage(user.chat_id, input, { parse_mode: "HTML" }); ok++; } catch { failed++; }
         }
-        return ctx.reply(tr(ctx.from.id, "broadcastDone", { ok, skipped, failed }));
+        return adminResult(tr(ctx.from.id, "broadcastDone", { ok, skipped, failed }));
       }
       if (pending.kind === "admin_stars") {
         const [id, amount] = input.split(/\s+/).map(Number);
         if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(amount) || amount <= 0) throw new Error("invalid ID or amount");
         await gramsrv.grantStars(id, amount, "Telegram bot administrator grant", pending.payload.operationID); await db.clearPending(ctx.from.id);
-        return ctx.reply(tr(ctx.from.id, "starsGranted", { id, amount }));
+        return adminResult(tr(ctx.from.id, "starsGranted", { id, amount }));
       }
       if (pending.kind === "admin_premium") {
         const [id, months] = input.split(/\s+/).map(Number);
         if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(months) || months <= 0) throw new Error("invalid ID or months");
         await gramsrv.grantPremium(id, months, "Telegram bot administrator grant", pending.payload.operationID); await db.clearPending(ctx.from.id);
-        return ctx.reply(tr(ctx.from.id, "premiumGranted", { id, months }));
+        return adminResult(tr(ctx.from.id, "premiumGranted", { id, months }));
       }
       if (pending.kind === "admin_promo") {
         const [code, starsRaw, limitRaw] = input.split(/\s+/);
         const stars = Number(starsRaw), limit = Number(limitRaw);
         const normalized = await db.createPromo(code, stars, limit); await db.clearPending(ctx.from.id);
-        return ctx.reply(tr(ctx.from.id, "promoCreated", { code: normalized }));
+        return adminResult(tr(ctx.from.id, "promoCreated", { code: normalized }));
       }
       if (pending.kind === "admin_giveaway") {
         const [starsRaw, limitRaw, ...words] = input.split(/\s+/);
         const item = await db.createGiveaway(words.join(" "), Number(starsRaw), Number(limitRaw)); await db.clearPending(ctx.from.id);
-        return ctx.reply(`🎁 ${escapeHTML(item.text)}`, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text(tr(ctx.from.id, "claimReward"), `giveaway:${item.id}`) });
+        return ctx.reply(`🎁 ${escapeHTML(item.text)}`, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text(tr(ctx.from.id, "claimReward"), `giveaway:${item.id}`).row().text(tr(ctx.from.id, "back"), "admin:menu") });
       }
       if (pending.kind === "admin_bonus") {
         const [id, amount] = input.split(/\s+/).map(Number);
         if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(amount) || amount === 0) throw new Error("invalid ID or amount");
         const balance = await db.addBonus(id, amount); await db.clearPending(ctx.from.id);
-        return ctx.reply(tr(ctx.from.id, "bonusBalance", { id, balance }));
+        return adminResult(tr(ctx.from.id, "bonusBalance", { id, balance }));
       }
       if (pending.kind === "admin_invoice") {
         const [idRaw, starsRaw, ...words] = input.split(/\s+/);
@@ -788,13 +841,24 @@ export function createBot({ config, db, gramsrv }) {
         if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(stars) || stars <= 0 || !title || title.length > 32) throw new Error("invalid invoice");
         const targetLanguage = languageOf(id);
         await bot.api.sendInvoice(id, title, translate(targetLanguage, "invoiceDescription", { title }), `custom|${Buffer.from(title).toString("base64url")}`, "XTR", [{ label: title, amount: stars }]);
-        await db.clearPending(ctx.from.id); return ctx.reply(tr(ctx.from.id, "invoiceSent"));
+        await db.clearPending(ctx.from.id); return adminResult(tr(ctx.from.id, "invoiceSent"));
       }
       if (pending.kind === "admin_access") {
         const [phone, telegramRaw] = input.split(/\s+/); const telegramID = Number(telegramRaw);
         if (!phone || !Number.isSafeInteger(telegramID) || telegramID <= 0) throw new Error("invalid phone or Telegram ID");
         await db.grantCodeAccess(phone, telegramID); await db.clearPending(ctx.from.id);
-        return ctx.reply(tr(ctx.from.id, "accessGranted", { phone: escapeHTML(phone), id: telegramID }), { parse_mode: "HTML" });
+        return adminResult(tr(ctx.from.id, "accessGranted", { phone: escapeHTML(phone), id: telegramID }));
+      }
+      if (pending.kind === "admin_bindphone") {
+        const [idRaw, ...phoneParts] = input.split(/\s+/);
+        const targetID = Number(idRaw); const phone = phoneParts.join("");
+        if (!Number.isSafeInteger(targetID) || targetID <= 0 || !phone) throw new Error("invalid Telegram ID or phone");
+        const user = await db.user(targetID);
+        if (!user) return adminResult(tr(ctx.from.id, "userNotFound"));
+        await db.bindVerifiedPhone(targetID, user.chat_id, phone);
+        if (user.server_user_id > 0) await gramsrv.setPhone(user.server_user_id, phone, "Telegram bot administrator phone bind");
+        await db.clearPending(ctx.from.id);
+        return adminResult(tr(ctx.from.id, "bindPhoneDone", { phone: escapeHTML(phone), id: targetID }));
       }
       if (pending.kind === "admin_refund") {
         const parts = input.split(/\s+/); let telegramID, chargeID, sale;
@@ -807,7 +871,7 @@ export function createBot({ config, db, gramsrv }) {
         await executeCompensatedRefund({ sale, telegramID, db, gramsrv, refundStarPayment: bot.api.refundStarPayment.bind(bot.api) });
         await db.clearPending(ctx.from.id);
         await bot.api.sendMessage(telegramID, tr(telegramID, "paymentRefunded", { charge: escapeHTML(chargeID) }), { parse_mode: "HTML" }).catch(() => {});
-        return ctx.reply(tr(ctx.from.id, "refundDone"));
+        return adminResult(tr(ctx.from.id, "refundDone"));
       }
       if (pending.kind === "admin_reply") {
         const [ticketRaw, ...words] = input.split(/\s+/); const ticketID = Number(ticketRaw), answer = words.join(" ").trim();
@@ -815,13 +879,13 @@ export function createBot({ config, db, gramsrv }) {
         if (!ticket || !answer) throw new Error("ticket not found or reply is empty");
         await bot.api.sendMessage(ticket.telegram_id, tr(ticket.telegram_id, "supportReply", { ticket: ticketID, answer: escapeHTML(answer) }), { parse_mode: "HTML" });
         await db.closeSupportMessage(ticketID); await db.clearPending(ctx.from.id);
-        return ctx.reply(tr(ctx.from.id, "supportReplySent", { ticket: ticketID }));
+        return adminResult(tr(ctx.from.id, "supportReplySent", { ticket: ticketID }));
       }
       if (pending.kind === "admin_rate") {
         const rate = Number(input);
         if (!Number.isSafeInteger(rate) || rate <= 0) throw new Error("invalid rate");
         await db.setSetting("stars_rate", rate); await db.clearPending(ctx.from.id);
-        return ctx.reply(tr(ctx.from.id, "rateSaved", { rate }));
+        return adminResult(tr(ctx.from.id, "rateSaved", { rate }));
       }
     } catch (error) {
       console.error("Bot input action failed", pending.kind, error);

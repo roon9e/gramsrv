@@ -42,7 +42,8 @@ async function deliverLoginCode(recipient, code, chatIDs) {
   for (const chatID of chatIDs) {
     try {
       const language = normalizeLanguage((await db.userByChatID(chatID))?.language, config.defaultLanguage);
-      await bot.api.sendMessage(chatID, loginCodeMessage(language, recipient, code), { parse_mode: "HTML" });
+      const sent = await bot.api.sendMessage(chatID, loginCodeMessage(language, recipient, code), { parse_mode: "HTML" });
+      if (sent?.message_id) setTimeout(() => bot.api.deleteMessage(chatID, sent.message_id).catch(() => {}), 120_000).unref?.();
       delivered++;
     }
     catch (error) { console.error("OTP delivery failed", chatID, error); }

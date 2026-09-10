@@ -366,6 +366,64 @@ test("admin ticket reply is delivered to the user's private chat", async () => {
   assert.match(confirm.payload.text, /#1/);
 });
 
+test("admin replies to a ticket by replying to the notification message", async () => {
+  const { bot, calls, db, config } = fixture();
+  config.ownerIDs.add(777);
+  await db.upsertUser({ id: 10, first_name: "User", language_code: "ru" }, 10, "ru");
+  await db.upsertUser({ id: 777, first_name: "Admin", language_code: "ru" }, 777, "ru");
+  await bot.handleUpdate(accountCallbackUpdate({ fromID: 10, chatID: 10, data: "menu:support" }));
+  await bot.handleUpdate(textUpdate({ fromID: 10, chatID: 10, text: "help me with my order" }));
+  await bot.handleUpdate({
+    update_id: Date.now(),
+    message: {
+      message_id: Date.now(), date: 1,
+      chat: { id: 777, type: "private" },
+      from: { id: 777, is_bot: false, first_name: "Admin", language_code: "ru" },
+      text: "restart your server",
+      reply_to_message: { message_id: 5, date: 1, chat: { id: 777, type: "private" }, from: { id: bot.botInfo.id, is_bot: true, first_name: "Test" }, text: "💬 Тикет #1\nОт: User (<code>10</code>)\n\nhelp me with my order" },
+    },
+  });
+  const delivered = calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === 10).at(-1);
+  assert.ok(delivered, "The reply should reach the user via Telegram native reply");
+  assert.match(delivered.payload.text, /restart your server/);
+  const ticket = await db.supportMessage(1);
+  assert.equal(ticket.status, "answered");
+  const confirmation = calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === 777).at(-1);
+  assert.match(confirmation.payload.text, /#1/);
+});
+
+test("admin lookup result shows the admin keyboard", async () => {
+  const { bot, calls, db, config } = fixture();
+  config.ownerIDs.add(777);
+  await db.upsertUser({ id: 10, first_name: "User", language_code: "ru" }, 10, "ru");
+  await db.upsertUser({ id: 777, first_name: "Admin", language_code: "ru" }, 777, "ru");
+  await bot.handleUpdate(accountCallbackUpdate({ fromID: 777, chatID: 777, data: "admin:lookup" }));
+  await bot.handleUpdate(textUpdate({ fromID: 777, chatID: 777, text: "10" }));
+  const sent = calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === 777).at(-1);
+  assert.ok(sent, "Lookup result should be sent");
+  const labels = (sent.payload.reply_markup?.inline_keyboard ?? []).flat().map((b) => b.text).join("\n");
+  assert.match(labels, /Статистика|Stats/);
+});
+
+test("admin binds a phone to any telegram account", async () => {
+  const { bot, calls, db, config, gramsrv } = fixture();
+  config.ownerIDs.add(777);
+  await db.upsertUser({ id: 10, first_name: "User", language_code: "ru" }, 10, "ru");
+  await db.upsertUser({ id: 777, first_name: "Admin", language_code: "ru" }, 777, "ru");
+  const user = await db.user(10);
+  user.server_user_id = 424242;
+  const setPhoneCalls = [];
+  gramsrv.setPhone = async (serverID, phone) => { setPhoneCalls.push({ serverID, phone }); };
+  await bot.handleUpdate(accountCallbackUpdate({ fromID: 777, chatID: 777, data: "admin:bindphone" }));
+  await bot.handleUpdate(textUpdate({ fromID: 777, chatID: 777, text: "10 +79991234567" }));
+  assert.deepEqual(setPhoneCalls, [{ serverID: 424242, phone: "+79991234567" }]);
+  const sent = calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === 777).at(-1);
+  assert.ok(sent);
+  assert.match(sent.payload.text, /привязан|bound/i);
+  const labels = (sent.payload.reply_markup?.inline_keyboard ?? []).flat().map((b) => b.text).join("\n");
+  assert.match(labels, /Привязать|Bind/);
+});
+
 test("requesting a new free number after buying +888 is refused", async () => {
   const { bot, calls, db } = fixture();
   await db.upsertUser({ id: 10, first_name: "User", language_code: "ru" }, 10, "ru");

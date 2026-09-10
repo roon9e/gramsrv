@@ -234,6 +234,18 @@ test("OTP codes are delivered to the chat bound to a verified phone", async () =
   await cleanTable("otp_deliveries"); await cleanTable("verified_phones"); await cleanTable("numbers"); await cleanTable("users");
 });
 
+test("rebinding a phone moves it from one telegram account to another", async () => {
+  if (!db) return;
+  await cleanTable("verified_phones"); await cleanTable("users");
+  await db.upsertUser({ id: 20, first_name: "A" }, 200, "ru");
+  await db.upsertUser({ id: 21, first_name: "B" }, 210, "ru");
+  await db.bindVerifiedPhone(20, 200, "+79990000001");
+  await db.bindVerifiedPhone(21, 210, "+79990000001");
+  assert.equal((await db.verifiedPhone(21))?.phone, "+79990000001");
+  assert.equal(await db.verifiedPhone(20), null);
+  await cleanTable("verified_phones"); await cleanTable("users");
+});
+
 test("admin exact lookups return correct data", async () => {
   if (!db) return;
   await cleanTable("verified_phones"); await cleanTable("numbers"); await cleanTable("users");

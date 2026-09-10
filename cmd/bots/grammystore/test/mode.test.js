@@ -230,11 +230,12 @@ test("real mode shows the main button menu after sharing a contact", async () =>
       contact: { phone_number: "+79991234567", first_name: "User", user_id: 10 },
     },
   });
-  const reply = calls.filter((c) => c.method === "sendMessage").at(-1);
-  assert.ok(reply, "Contact share should produce a reply");
-  assert.match(reply.payload.text, /привязан|linked/i);
-  assert.equal(reply.payload.reply_markup?.remove_keyboard, undefined, "The contact keyboard should not be removed");
-  const labels = (reply.payload.reply_markup?.inline_keyboard ?? []).flat().map((b) => b.text).join("\n");
+  const sent = calls.filter((c) => c.method === "sendMessage");
+  assert.ok(sent.length >= 2, "Contact share should produce a toast and the main menu");
+  const toast = sent[0];
+  assert.match(toast.payload.text, /привязан|linked/i);
+  const menu = sent.at(-1);
+  const labels = (menu.payload.reply_markup?.inline_keyboard ?? []).flat().map((b) => b.text).join("\n");
   assert.match(labels, /Поддержка|Support/);
   assert.equal(await db.verifiedPhone(10).then((v) => v.phone), "+79991234567");
 });

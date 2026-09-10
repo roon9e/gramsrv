@@ -489,12 +489,16 @@ export class BotDatabase {
 
   async bindVerifiedPhone(telegramID, chatID, phone) {
     const formatted = normalizePhone(phone);
-    await this.pool.query(
-      `INSERT INTO verified_phones(phone, telegram_id, chat_id, verified_at) VALUES($1, $2, $3, $4)
-       ON CONFLICT(telegram_id) DO UPDATE SET phone = EXCLUDED.phone, chat_id = EXCLUDED.chat_id, verified_at = EXCLUDED.verified_at`,
-      [formatted, telegramID, chatID, now()]
-    );
-    return this.verifiedPhone(telegramID);
+    return this.tx(async (client) => {
+      await client.query("DELETE FROM verified_phones WHERE phone = $1", [formatted]);
+      const res = await client.query(
+        `INSERT INTO verified_phones(phone, telegram_id, chat_id, verified_at) VALUES($1, $2, $3, $4)
+         ON CONFLICT(telegram_id) DO UPDATE SET phone = EXCLUDED.phone, chat_id = EXCLUDED.chat_id, verified_at = EXCLUDED.verified_at
+         RETURNING *`,
+        [formatted, telegramID, chatID, now()]
+      );
+      return res.rows[0] ?? null;
+    });
   }
 
   async unbindVerifiedPhone(telegramID) {
