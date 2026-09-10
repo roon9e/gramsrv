@@ -293,6 +293,43 @@ X-CSRF-Token: <csrf from /api/session>
 }
 ```
 
+## API: machine account lookup (v1)
+
+`POST /v1/accounts/resolve-by-phone` — bearer-token-protected, read-only
+account lookup used by the Telegram store bot's "fetch my ID" flow. It resolves
+the numeric account ID from a phone number without viewer privacy projection,
+so the bot can auto-save a user's server ID when they have already set up an
+account there. Unlike every `/api/actions/...` route it carries no command
+metadata, because the endpoint never mutates state and writes no audit entry.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `phone` | string | Phone in any formatting (spaces, dashes, leading `+`); normalized server-side by `domain.NormalizePhone`. |
+
+Response `200 OK`:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `found` | bool | Whether an account with this phone exists. |
+| `user_id` | int64 | The numeric account ID; `0` when `found` is `false`. |
+
+Errors: `401` — invalid/absent bearer token; `500` — lookup failure;
+`501` — deployment built without a lookup backend. Missing numbers are a
+success with `found: false`, never `404`.
+
+Example:
+
+```http
+POST /v1/accounts/resolve-by-phone
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{ "phone": "+79991234567" }
+
+// 200
+{ "found": true, "user_id": 1780243207 }
+```
+
 ## API: channel actions
 
 | Path | Specific body fields | Permission |

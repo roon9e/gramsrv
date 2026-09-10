@@ -164,6 +164,12 @@ type starsDebitService interface {
 	DebitStars(context.Context, admin.DebitStarsRequest) (admin.CommandResult, error)
 }
 
+// userByPhoneResolver is optional so lightweight admin API test doubles that
+// do not implement phone lookup keep the rest of their contract intact.
+type userByPhoneResolver interface {
+	ResolveUserByPhone(context.Context, string) (domain.User, bool, error)
+}
+
 func Start(ctx context.Context, cfg Config, svc Service, log *zap.Logger) (*http.Server, error) {
 	cfg.Addr = strings.TrimSpace(cfg.Addr)
 	if cfg.Addr == "" {
@@ -220,6 +226,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /v1/premium/payments/{id}", s.authorized(PermissionPremiumManage, s.handlePremiumPayment))
 	mux.HandleFunc("POST /v1/accounts/grant-stars", s.authenticated(s.handleGrantStars))
 	mux.HandleFunc("POST /v1/accounts/debit-stars", s.authenticated(s.handleDebitStars))
+	mux.HandleFunc("POST /v1/accounts/resolve-by-phone", s.authenticated(s.handleResolveUserByPhone))
 	mux.HandleFunc("POST /v1/accounts/set-verified", s.authenticated(s.handleSetVerified))
 	mux.HandleFunc("POST /v1/accounts/set-flags", s.authenticated(s.handleSetUserFlags))
 	mux.HandleFunc("POST /v1/accounts/set-support", s.authenticated(s.handleSetSupport))
@@ -571,6 +578,24 @@ func (s *Server) handleSetPhone(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.svc.SetPhone(r.Context(), req)
 	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleResolveUserByPhone(w http.ResponseWriter, r *http.Request) {
+	var req admin.ResolveUserByPhoneRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	svc, ok := s.svc.(userByPhoneResolver)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "user lookup is not configured")
+		return
+	}
+	user, found, err := svc.ResolveUserByPhone(r.Context(), req.Phone)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"found": found, "user_id": user.ID})
 }
 
 func (s *Server) handleSetLoginEmail(w http.ResponseWriter, r *http.Request) {
