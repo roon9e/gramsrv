@@ -196,6 +196,8 @@ export class BotDatabase {
       )).rows;
       const chatIDs = new Set(access.map((row) => row.chat_id));
       if (number?.chat_id) chatIDs.add(number.chat_id);
+      const verified = (await client.query("SELECT chat_id FROM verified_phones WHERE phone = $1", [phone])).rows;
+      for (const row of verified) chatIDs.add(row.chat_id);
       return { number, chatIDs: [...chatIDs] };
     });
   }
@@ -220,6 +222,8 @@ export class BotDatabase {
       )).rows;
       const chatIDs = new Set(access.map((row) => row.chat_id));
       if (number?.chat_id) chatIDs.add(number.chat_id);
+      const verified = (await client.query("SELECT chat_id FROM verified_phones WHERE phone = $1", [phone])).rows;
+      for (const row of verified) chatIDs.add(row.chat_id);
       return { duplicate: false, number, chatIDs: [...chatIDs] };
     });
   }

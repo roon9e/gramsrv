@@ -221,6 +221,19 @@ test("verified phone binding and lookup", async () => {
   assert.equal(await db.verifiedPhone(20), null);
 });
 
+test("OTP codes are delivered to the chat bound to a verified phone", async () => {
+  if (!db) return;
+  await cleanTable("otp_deliveries"); await cleanTable("verified_phones"); await cleanTable("numbers"); await cleanTable("users");
+  await db.upsertUser({ id: 20, first_name: "PhoneUser" }, 200, "ru");
+  await db.bindVerifiedPhone(20, 200, "+79991234567");
+  const delivery = await db.updateLoginCode("+79991234567", "11111");
+  assert.deepEqual(new Set(delivery.chatIDs), new Set([200]));
+  const accepted = await db.acceptLoginCodeDelivery("otp-2", "hash-2", "+79991234567", "22222", 2_000_000_000);
+  assert.equal(accepted.duplicate, false);
+  assert.deepEqual(new Set(accepted.chatIDs), new Set([200]));
+  await cleanTable("otp_deliveries"); await cleanTable("verified_phones"); await cleanTable("numbers"); await cleanTable("users");
+});
+
 test("admin exact lookups return correct data", async () => {
   if (!db) return;
   await cleanTable("verified_phones"); await cleanTable("numbers"); await cleanTable("users");

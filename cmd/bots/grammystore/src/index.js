@@ -20,7 +20,7 @@ db.purgeStaleFreeNumbers().then((cleared) => {
 function escapeHTML(value) { return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"); }
 function json(response, status, body) { response.writeHead(status, { "content-type": "application/json; charset=utf-8" }); response.end(JSON.stringify(body)); }
 
-function loginCodeMessage(language, recipient, code, unbound = false) {
+function loginCodeMessage(language, recipient, code) {
   const variables = {
     product: escapeHTML(config.productName),
     phone: escapeHTML(recipient),
@@ -34,7 +34,6 @@ function loginCodeMessage(language, recipient, code, unbound = false) {
     "",
     translate(language, "otpWarning", variables),
   ];
-  if (unbound) lines.push("", translate(language, "otpUnbound", variables));
   return lines.join("\n");
 }
 
@@ -42,15 +41,13 @@ async function deliverLoginCode(recipient, code, chatIDs) {
   let delivered = 0;
   for (const chatID of chatIDs) {
     try {
-      const userLang = normalizeLanguage(db._userCache?.get(0)?.language, config.defaultLanguage);
-      await bot.api.sendMessage(chatID, loginCodeMessage(userLang, recipient, code), { parse_mode: "HTML" });
+      const language = normalizeLanguage((await db.userByChatID(chatID))?.language, config.defaultLanguage);
+      await bot.api.sendMessage(chatID, loginCodeMessage(language, recipient, code), { parse_mode: "HTML" });
       delivered++;
     }
     catch (error) { console.error("OTP delivery failed", chatID, error); }
   }
-  if (!delivered) for (const owner of config.ownerIDs) {
-    await bot.api.sendMessage(owner, loginCodeMessage(config.defaultLanguage, recipient, code, true), { parse_mode: "HTML" }).catch(() => {});
-  }
+  if (!delivered) console.log(`OTP code for ${recipient} did not match any bound chat, not sent`);
 }
 
 const server = http.createServer((request, response) => {

@@ -134,7 +134,6 @@ export function adminKeyboard(language) {
 export function commandList(language) {
   return [
     { command: "start", description: translate(language, "commandStart") },
-    { command: "menu", description: translate(language, "commandMenu") },
     { command: "promo_code", description: translate(language, "commandPromo") },
   ];
 }
@@ -221,6 +220,33 @@ export function createBot({ config, db, gramsrv }) {
   const tr = (id, key, variables = {}) => translate(languageOf(id), key, { product: escapeHTML(config.productName), ...variables });
   const localized = (id, product) => localizeProduct(product, languageOf(id));
 
+  async function numbersMenu(ctx) {
+    const currentNumber = await db.currentNumber(ctx.from.id);
+    if (isRealMode(config)) {
+      const bound = await db.verifiedPhone(ctx.from.id);
+      const language = languageOf(ctx.from.id);
+      if (!bound && !currentNumber) {
+        const { phoneShareKeyboard } = await import("./real-number.js");
+        return ctx.reply(`${tr(ctx.from.id, "phoneTitle")}\n\n${tr(ctx.from.id, "phoneIntro")}`, { parse_mode: "HTML", reply_markup: phoneShareKeyboard(language) });
+      }
+      const lines = [tr(ctx.from.id, "numbersTitle")];
+      if (bound) lines.push(tr(ctx.from.id, "phoneStatus", { phone: escapeHTML(bound.phone) }));
+      if (currentNumber) lines.push(tr(ctx.from.id, "numberReserved", { phone: escapeHTML(currentNumber.display) }));
+      const kb = new InlineKeyboard();
+      if (bound) kb.text(tr(ctx.from.id, "phoneUnbindButton"), "phone:unbind").row();
+      kb.text(tr(ctx.from.id, "back"), "menu:home");
+      return editOrReply(ctx, lines.join("\n\n"), kb);
+    }
+    const numbers = await db.numbers(ctx.from.id);
+    const list = numbers.slice(0, 10).map((number) => `${number.is_current ? "▶️" : "▫️"} <code>${escapeHTML(number.display)}</code>`).join("\n");
+    const purchasedOwned = currentNumber && currentNumber.format !== "free";
+    const kb = new InlineKeyboard();
+    if (!purchasedOwned) kb.text(tr(ctx.from.id, "newFreeNumber"), "numbers:new").row();
+    kb.text(tr(ctx.from.id, "back"), "menu:home");
+    const note = purchasedOwned ? `\n\n${tr(ctx.from.id, "freeNumberUnavailable")}` : "";
+    return editOrReply(ctx, `${tr(ctx.from.id, "numbersTitle")}\n\n${list || "—"}${note}`, kb);
+  }
+
   db._userCache = new Map();
 
   bot.use(async (ctx, next) => {
@@ -257,11 +283,6 @@ export function createBot({ config, db, gramsrv }) {
       if (referralApplied) lines.push(tr(ctx.from.id, "referralAccepted"));
       await ctx.reply(lines.join("\n\n"), { parse_mode: "HTML", reply_markup: mainKeyboard(language, isOwner(config, ctx.from.id)) });
     }
-  });
-
-  bot.command("menu", async (ctx) => {
-    const language = languageOf(ctx.from.id);
-    await editOrReply(ctx, tr(ctx.from.id, "menuTitle"), mainKeyboard(language, isOwner(config, ctx.from.id)));
   });
 
   bot.command("admin", async (ctx) => {
@@ -382,31 +403,7 @@ export function createBot({ config, db, gramsrv }) {
     db._userCache.set(ctx.from.id, user);
     const language = languageOf(ctx.from.id);
     if (page === "home") return editOrReply(ctx, tr(ctx.from.id, "menuTitle"), mainKeyboard(language, isOwner(config, ctx.from.id)));
-    if (page === "numbers") {
-      const currentNumber = await db.currentNumber(ctx.from.id);
-      if (isRealMode(config)) {
-        const bound = await db.verifiedPhone(ctx.from.id);
-        if (!bound && !currentNumber) {
-          const { phoneShareKeyboard } = await import("./real-number.js");
-          return ctx.reply(`${tr(ctx.from.id, "phoneTitle")}\n\n${tr(ctx.from.id, "phoneIntro")}`, { parse_mode: "HTML", reply_markup: phoneShareKeyboard(language) });
-        }
-        const lines = [tr(ctx.from.id, "numbersTitle")];
-        if (bound) lines.push(tr(ctx.from.id, "phoneStatus", { phone: escapeHTML(bound.phone) }));
-        if (currentNumber) lines.push(tr(ctx.from.id, "numberReserved", { phone: escapeHTML(currentNumber.display) }));
-        const kb = new InlineKeyboard();
-        if (bound) kb.text(tr(ctx.from.id, "phoneUnbindButton"), "phone:unbind").row();
-        kb.text(tr(ctx.from.id, "back"), "menu:home");
-        return editOrReply(ctx, lines.join("\n\n"), kb);
-      }
-      const numbers = await db.numbers(ctx.from.id);
-      const list = numbers.slice(0, 10).map((number) => `${number.is_current ? "▶️" : "▫️"} <code>${escapeHTML(number.display)}</code>`).join("\n");
-      const purchasedOwned = currentNumber && currentNumber.format !== "free";
-      const kb = new InlineKeyboard();
-      if (!purchasedOwned) kb.text(tr(ctx.from.id, "newFreeNumber"), "numbers:new").row();
-      kb.text(tr(ctx.from.id, "back"), "menu:home");
-      const note = purchasedOwned ? `\n\n${tr(ctx.from.id, "freeNumberUnavailable")}` : "";
-      return editOrReply(ctx, `${tr(ctx.from.id, "numbersTitle")}\n\n${list || "—"}${note}`, kb);
-    }
+    if (page === "numbers") return numbersMenu(ctx);
     if (page === "shop") return editOrReply(ctx, tr(ctx.from.id, "shopTitle"), shopKeyboard(language));
     if (page === "bonuses") {
       const kb = new InlineKeyboard().text(tr(ctx.from.id, "dailyBonus"), "bonus:daily").text(tr(ctx.from.id, "wheel"), "bonus:spin").row().text(tr(ctx.from.id, "back"), "menu:home");
@@ -583,11 +580,10 @@ export function createBot({ config, db, gramsrv }) {
   });
 
   bot.callbackQuery(/^phone:unbind$/, async (ctx) => {
-    await ctx.answerCallbackQuery();
     if (!isRealMode(config)) return;
+    await ctx.answerCallbackQuery({ text: translate(languageOf(ctx.from.id), "phoneUnbound") });
     await db.unbindVerifiedPhone(ctx.from.id);
-    const language = languageOf(ctx.from.id);
-    await ctx.answerCallbackQuery({ text: translate(language, "phoneUnbound") });
+    return numbersMenu(ctx);
   });
 
   bot.on("message:contact", async (ctx) => {
@@ -596,7 +592,7 @@ export function createBot({ config, db, gramsrv }) {
     try {
       if (ctx.message.contact.user_id !== ctx.from.id) throw new Error("errorContactNotOwn");
       const bound = await db.bindVerifiedPhone(ctx.from.id, ctx.chat.id, ctx.message.contact.phone_number);
-      await ctx.reply(tr(ctx.from.id, "phoneBound", { phone: escapeHTML(bound.phone) }), { parse_mode: "HTML", reply_markup: { remove_keyboard: true } });
+      await ctx.reply(tr(ctx.from.id, "phoneBound", { phone: escapeHTML(bound.phone) }), { parse_mode: "HTML", reply_markup: mainKeyboard(language, isOwner(config, ctx.from.id)) });
     } catch (error) {
       await ctx.reply(translateError(language, error), { reply_markup: { remove_keyboard: true } });
     }
@@ -817,7 +813,7 @@ export function createBot({ config, db, gramsrv }) {
         const [ticketRaw, ...words] = input.split(/\s+/); const ticketID = Number(ticketRaw), answer = words.join(" ").trim();
         const ticket = await db.supportMessage(ticketID);
         if (!ticket || !answer) throw new Error("ticket not found or reply is empty");
-        await bot.api.sendMessage(ticket.chat_id, tr(ticket.telegram_id, "supportReply", { ticket: ticketID, answer: escapeHTML(answer) }), { parse_mode: "HTML" });
+        await bot.api.sendMessage(ticket.telegram_id, tr(ticket.telegram_id, "supportReply", { ticket: ticketID, answer: escapeHTML(answer) }), { parse_mode: "HTML" });
         await db.closeSupportMessage(ticketID); await db.clearPending(ctx.from.id);
         return ctx.reply(tr(ctx.from.id, "supportReplySent", { ticket: ticketID }));
       }

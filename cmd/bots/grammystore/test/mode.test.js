@@ -218,6 +218,43 @@ test("real mode allows buying anonymous +888 number products", async () => {
   assert.match(labels, /\+888/);
 });
 
+test("real mode shows the main button menu after sharing a contact", async () => {
+  const { bot, calls, db } = createBotWithMode("real");
+  await db.upsertUser({ id: 10, first_name: "User" }, 10, "ru");
+  await bot.handleUpdate({
+    update_id: 1,
+    message: {
+      message_id: 9, date: 1,
+      chat: { id: 10, type: "private" },
+      from: { id: 10, is_bot: false, first_name: "User" },
+      contact: { phone_number: "+79991234567", first_name: "User", user_id: 10 },
+    },
+  });
+  const reply = calls.filter((c) => c.method === "sendMessage").at(-1);
+  assert.ok(reply, "Contact share should produce a reply");
+  assert.match(reply.payload.text, /привязан|linked/i);
+  assert.equal(reply.payload.reply_markup?.remove_keyboard, undefined, "The contact keyboard should not be removed");
+  const labels = (reply.payload.reply_markup?.inline_keyboard ?? []).flat().map((b) => b.text).join("\n");
+  assert.match(labels, /Поддержка|Support/);
+  assert.equal(await db.verifiedPhone(10).then((v) => v.phone), "+79991234567");
+});
+
+test("real mode unbind answers once and re-renders the numbers view", async () => {
+  const { bot, calls, db } = createBotWithMode("real");
+  await db.upsertUser({ id: 10, first_name: "User" }, 10, "ru");
+  await db.bindVerifiedPhone(10, 10, "+79991234567");
+  const menuUpdate = { update_id: 1, callback_query: { id: "cb-1", from: { id: 10, is_bot: false, first_name: "User" }, chat_instance: "instance", data: "menu:numbers", message: { message_id: 1, date: 1, chat: { id: 10, type: "private" }, text: "Numbers" } } };
+  const unbindUpdate = { update_id: 2, callback_query: { id: "cb-2", from: { id: 10, is_bot: false, first_name: "User" }, chat_instance: "instance", data: "phone:unbind", message: { message_id: 2, date: 1, chat: { id: 10, type: "private" }, text: "Numbers" } } };
+  await bot.handleUpdate(menuUpdate);
+  await bot.handleUpdate(unbindUpdate);
+  const answers = calls.filter((c) => c.method === "answerCallbackQuery");
+  assert.equal(answers.length, 2, "one answer per callback");
+  assert.match(answers.at(-1).payload.text, /отвязан|unlinked/i);
+  const prompts = calls.filter((c) => c.method === "sendMessage").map((c) => c.payload.text).join("\n");
+  assert.match(prompts, /Привязка номера|Phone binding/i);
+  assert.equal(await db.verifiedPhone(10), null);
+});
+
 test("real mode rejects a second anonymous number purchase", async () => {
   const { bot, calls, db } = createBotWithMode("real");
   await db.upsertUser({ id: 10, first_name: "User" }, 10, "ru");

@@ -8,6 +8,8 @@ const botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot
 function mockDb() {
   const users = new Map();
   const numbers = new Map();
+  const tickets = new Map();
+  const pendingState = new Map();
   let numberSeq = 1;
   const db = {
     _userCache: new Map(),
@@ -59,9 +61,9 @@ function mockDb() {
     getSetting: async () => "20",
     setSetting: async () => {},
     starsRate: async () => 20,
-    setPending: async () => {},
-    pending: async () => null,
-    clearPending: async () => {},
+    setPending: async (id, kind, payload = {}) => { pendingState.set(id, { kind, payload }); },
+    pending: async (id) => pendingState.get(id) ?? null,
+    clearPending: async (id) => { pendingState.delete(id); },
     recentRecipients: async () => [],
     rememberRecipient: async () => {},
     reserveSpin: async () => ({ prize: 50, day: "2026-01-01" }),
@@ -83,9 +85,9 @@ function mockDb() {
     markRefundInternal: async () => {},
     failRefund: async () => {},
     markRefunded: async () => {},
-    addSupportMessage: async () => 1,
-    supportMessage: async () => null,
-    closeSupportMessage: async () => {},
+    addSupportMessage: async (id, chatID, text) => { const ticket = tickets.size + 1; tickets.set(ticket, { id: ticket, telegram_id: id, chat_id: chatID, text, status: "open", created_at: 0, answered_at: 0 }); return ticket; },
+    supportMessage: async (ticketID) => tickets.get(ticketID) ?? null,
+    closeSupportMessage: async (ticketID) => { const t = tickets.get(ticketID); if (t) t.status = "answered"; },
     verifiedPhone: async () => null,
     bindVerifiedPhone: async () => ({ phone: "+79990000000" }),
     unbindVerifiedPhone: async () => true,
@@ -330,6 +332,38 @@ test("numbers menu still offers a free number for a user with no purchased numbe
   const edit = calls.find((call) => call.method === "editMessageText");
   const labels = edit.payload.reply_markup.inline_keyboard.flat().map((button) => button.text).join("\n");
   assert.match(labels, /Новый бесплатный номер/);
+});
+
+function textUpdate({ fromID, chatID, text }) {
+  return {
+    update_id: Date.now(),
+    message: {
+      message_id: Date.now(),
+      date: 1,
+      chat: { id: chatID, type: "private" },
+      from: { id: fromID, is_bot: false, first_name: "User", language_code: "ru" },
+      text,
+    },
+  };
+}
+
+test("admin ticket reply is delivered to the user's private chat", async () => {
+  const { bot, calls, db, config } = fixture();
+  config.ownerIDs.add(777);
+  await db.upsertUser({ id: 10, first_name: "User", language_code: "ru" }, 10, "ru");
+  await db.upsertUser({ id: 777, first_name: "Admin", language_code: "ru" }, 777, "ru");
+  await bot.handleUpdate(accountCallbackUpdate({ fromID: 10, chatID: 10, data: "menu:support" }));
+  await bot.handleUpdate(textUpdate({ fromID: 10, chatID: 10, text: "help me with my order" }));
+  await bot.handleUpdate(accountCallbackUpdate({ fromID: 777, chatID: 777, data: "admin:reply" }));
+  await bot.handleUpdate(textUpdate({ fromID: 777, chatID: 777, text: "1 restart your server" }));
+  const delivered = calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === 10).at(-1);
+  assert.ok(delivered, "The reply should be delivered to the user's private chat");
+  assert.match(delivered.payload.text, /restart your server/);
+  assert.match(delivered.payload.text, /обращени|тикет|ticket/i);
+  const ticket = await db.supportMessage(1);
+  assert.equal(ticket.status, "answered");
+  const confirm = calls.find((call) => call.method === "sendMessage" && call.payload.chat_id === 777);
+  assert.match(confirm.payload.text, /#1/);
 });
 
 test("requesting a new free number after buying +888 is refused", async () => {
