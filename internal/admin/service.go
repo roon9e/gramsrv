@@ -237,6 +237,14 @@ type AccountService interface {
 	LoginEmail(ctx context.Context, userID int64) (string, bool, error)
 }
 
+// UserLookup resolves an account by its phone number without viewer privacy
+// projection. The grammystore bot uses it to discover an existing account's
+// numeric ID from the phone the user already bound to the bot, so the operator
+// flagging "fetch my ID" never needs to type it by hand.
+type UserLookup interface {
+	ByPhone(ctx context.Context, phone string) (domain.User, bool, error)
+}
+
 type StarsService interface {
 	Credit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
 	Debit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
@@ -436,6 +444,7 @@ type Dependencies struct {
 	Auth                   AuthService
 	Revoker                AuthKeyRevoker
 	Users                  UsersService
+	UserLookup             UserLookup
 	Account                AccountService
 	Photos                 AvatarResolver
 	Stars                  StarsService
@@ -472,6 +481,7 @@ type Service struct {
 	auth                   AuthService
 	revoker                AuthKeyRevoker
 	users                  UsersService
+	userLookup             UserLookup
 	account                AccountService
 	photos                 AvatarResolver
 	stars                  StarsService
@@ -520,6 +530,9 @@ func (s *Service) Configure(deps Dependencies) *Service {
 	}
 	if deps.Users != nil {
 		s.users = deps.Users
+	}
+	if deps.UserLookup != nil {
+		s.userLookup = deps.UserLookup
 	}
 	if deps.Account != nil {
 		s.account = deps.Account
@@ -969,6 +982,13 @@ type SetPhoneRequest struct {
 	CommandMeta
 	UserID int64  `json:"user_id"`
 	Phone  string `json:"phone"`
+}
+
+// ResolveUserByPhoneRequest is a read-only account lookup used by the
+// grammystore bot's "fetch my ID" flow. It carries no CommandMeta: resolving
+// a phone never writes anything, so there is no audit entry to keep.
+type ResolveUserByPhoneRequest struct {
+	Phone string `json:"phone"`
 }
 
 type SetLoginEmailRequest struct {
@@ -2102,6 +2122,17 @@ func (s *Service) SetPhone(ctx context.Context, req SetPhoneRequest) (CommandRes
 		}
 		return CommandResult{Message: "phone updated", Details: details}, nil
 	})
+}
+
+func (s *Service) ResolveUserByPhone(ctx context.Context, phone string) (domain.User, bool, error) {
+	if s == nil || s.userLookup == nil {
+		return domain.User{}, false, fmt.Errorf("admin user lookup is not configured")
+	}
+	canonical := domain.NormalizePhone(phone)
+	if canonical == "" {
+		return domain.User{}, false, nil
+	}
+	return s.userLookup.ByPhone(ctx, canonical)
 }
 
 func (s *Service) SetLoginEmail(ctx context.Context, req SetLoginEmailRequest) (CommandResult, error) {
