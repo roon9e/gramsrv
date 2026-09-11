@@ -54,7 +54,7 @@ export async function reverseSaleFulfillment(sale, db, gramsrv) {
     await gramsrv.revokeUsername(item.username, item.recipientID, key);
   } else if (item.kind === "number") {
     if (!positiveInteger(item.numberID) || !item.phone) throw new Error("sale has no stored number data");
-    await db.revokePurchasedNumber(item.ownerID, item.numberID, item.phone);
+    await db.revokePurchasedNumber(item.ownerID, item.numberID, item.phone, (phone) => gramsrv.resolveUserByPhone(phone));
   } else throw new Error("unknown fulfillment kind");
   return item;
 }
@@ -171,12 +171,6 @@ function parseStartRef(ctx) {
   return match ? Number(match[1]) : 0;
 }
 
-async function syncFreeNumber(gramsrv, user, number) {
-  if (user?.server_user_id > 0) {
-    await gramsrv.setPhone(user.server_user_id, number.phone, `number:${number.id}`);
-  }
-}
-
 function productText(product, language) {
   const extra = product.kind === KINDS.username
     ? `\n${translate(language, "productBid", { bid: product.bid })}`
@@ -258,6 +252,8 @@ export function createBot({ config, db, gramsrv }) {
   db._userCache = new Map();
 
   bot.use(async (ctx, next) => {
+    // Account/number flows and OTP routing are private-chat only.
+    if (ctx.chat && ctx.chat.type !== "private") return;
     const isStart = isStartCommand(ctx.message?.text);
     if (ctx.from && ctx.chat && !isStart) {
       const user = await db.upsertUser(ctx.from, ctx.chat.id, initialLanguage(ctx.from, config.defaultLanguage));
@@ -276,7 +272,6 @@ export function createBot({ config, db, gramsrv }) {
 
     if (isRandomMode(config)) {
       const number = await db.createNumber(ctx.from.id, ctx.chat.id, "free", config.defaultNumberCountry, false);
-      await syncFreeNumber(gramsrv, user, number);
       const referralApplied = !existed && referrer > 0 && (await db.user(ctx.from.id))?.referred_by === referrer;
       const lines = [tr(ctx.from.id, "startHello"), tr(ctx.from.id, "startPhone", { phone: escapeHTML(number.display) })];
       if (referralApplied) lines.push(tr(ctx.from.id, "referralAccepted"));
@@ -354,17 +349,14 @@ export function createBot({ config, db, gramsrv }) {
       await gramsrv.mintUsername(recipientID, username, product.bid, key);
       fulfillment = { kind: "username", recipientID, username, bid: product.bid };
     } else if (product.kind === KINDS.number) {
-      number = await db.createNumber(buyer.id, chatID, product.numberFormat, "ANON", true);
-      const user = await db.user(buyer.id);
-      await syncFreeNumber(gramsrv, user, number);
-      await db.unbindVerifiedPhone(buyer.id);
       recipientID = buyer.id;
-      fulfillment = { kind: "number", ownerID: buyer.id, numberID: number.id, phone: number.phone, format: number.format };
+      const view = localized(buyer.id, product);
+      number = await db.fulfillNumberPurchase({ product: product.code, title: view.title, starsPrice: product.starsPrice, recipientID, buyerID: buyer.id, buyerName: userName(buyer), chargeID }, chatID, product.numberFormat);
     } else throw new Error("unknown product kind");
     const productView = localized(buyer.id, product);
-    await db.addSale({ product: product.code, title: productView.title, starsPrice: product.starsPrice, recipientID, buyerID: buyer.id, buyerName: userName(buyer), chargeID, fulfillment });
+    if (!number) await db.addSale({ product: product.code, title: productView.title, starsPrice: product.starsPrice, recipientID, buyerID: buyer.id, buyerName: userName(buyer), chargeID, fulfillment });
     const message = number
-      ? tr(buyer.id, isRealMode(config) ? "numberChanged" : "numberReserved", { phone: escapeHTML(number.display) })
+      ? tr(buyer.id, "numberReserved", { phone: escapeHTML(number.display) })
       : tr(buyer.id, "productGranted", { title: escapeHTML(productView.title), id: recipientID });
     const sent = await bot.api.sendMessage(chatID, message, { parse_mode: "HTML" }).catch(() => null);
     if (chatID > 0 && sent) deleteAfter(chatID, sent.message_id);
@@ -398,6 +390,25 @@ export function createBot({ config, db, gramsrv }) {
       for (const owner of config.ownerIDs) {
         await bot.api.sendMessage(owner, tr(owner, "fulfillmentOwnerError", { charge: escapeHTML(payment.telegram_payment_charge_id), error: escapeHTML(error.message) }), { parse_mode: "HTML" }).catch(() => {});
       }
+    }
+  });
+
+  // Explicit recovery for a stored number payment after a database/process
+  // failure. Never manufacture a payment or ask the customer to pay again.
+  bot.command("retry_payment", async (ctx) => {
+    if (!isOwner(config, ctx.from.id)) return;
+    try {
+      const payment = await db.paymentByCharge(String(ctx.match ?? "").trim());
+      if (!payment) throw new Error("payment not found");
+      const parsed = parsePayload(payment.invoice_payload);
+      const product = findProduct(parsed.code, await db.starsRate());
+      if (product?.kind !== KINDS.number || product.starsPrice !== payment.amount) throw new Error("only stored number payments can be retried");
+      const buyer = await db.user(payment.telegram_id);
+      if (!buyer) throw new Error("user not found");
+      await fulfill(product, buyer.telegram_id, { id: buyer.telegram_id, first_name: buyer.first_name, username: buyer.username }, buyer.telegram_id, payment.charge_id);
+      await ctx.reply(tr(ctx.from.id, "numberPaymentRecovered"));
+    } catch (error) {
+      await ctx.reply(translateError(languageOf(ctx.from.id), error));
     }
   });
 
@@ -451,10 +462,12 @@ export function createBot({ config, db, gramsrv }) {
     if (await hasActiveAnonymousNumber(db, ctx.from.id)) {
       return editOrReply(ctx, tr(ctx.from.id, "freeNumberUnavailable"), backKeyboard(language, "menu:numbers"));
     }
-    const number = await db.createNumber(ctx.from.id, ctx.chat.id, "free", ctx.match[1], true);
-    const user = await db.user(ctx.from.id);
-    await syncFreeNumber(gramsrv, user, number);
-    await editOrReply(ctx, tr(ctx.from.id, "newNumber", { phone: escapeHTML(number.display) }), backKeyboard(language, "menu:numbers"));
+    try {
+      const number = await db.createNumber(ctx.from.id, ctx.chat.id, "free", ctx.match[1], true);
+      await editOrReply(ctx, tr(ctx.from.id, "newNumber", { phone: escapeHTML(number.display) }), backKeyboard(language, "menu:numbers"));
+    } catch (error) {
+      await editOrReply(ctx, translateError(language, error), backKeyboard(language, "menu:numbers"));
+    }
   });
 
   bot.callbackQuery(/^shop:(premium|stars|number|username)$/, async (ctx) => {
@@ -856,7 +869,6 @@ export function createBot({ config, db, gramsrv }) {
         const user = await db.user(targetID);
         if (!user) return adminResult(tr(ctx.from.id, "userNotFound"));
         await db.bindVerifiedPhone(targetID, user.chat_id, phone);
-        if (user.server_user_id > 0) await gramsrv.setPhone(user.server_user_id, phone, "Telegram bot administrator phone bind");
         await db.clearPending(ctx.from.id);
         return adminResult(tr(ctx.from.id, "bindPhoneDone", { phone: escapeHTML(phone), id: targetID }));
       }

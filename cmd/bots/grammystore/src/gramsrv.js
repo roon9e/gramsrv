@@ -28,13 +28,12 @@ export class GramsrvClient {
     return this.post("/v1/accounts/debit-stars", this.command(reason, { user_id: userID, amount }, idempotencyKey));
   }
 
-  setPhone(userID, phone, reason = "Telegram bot number replacement", idempotencyKey = "") {
-    return this.post("/v1/accounts/set-phone", this.command(reason, { user_id: userID, phone }, idempotencyKey));
-  }
-
   async resolveUserByPhone(phone) {
     const result = await this.post("/v1/accounts/resolve-by-phone", { phone });
-    return result && result.found ? Number(result.user_id) : 0;
+    if (result?.found === false && result.user_id === 0) return 0;
+    const id = Number(result?.user_id);
+    if (result?.found === true && Number.isSafeInteger(id) && id > 0) return id;
+    throw new Error("invalid account lookup response");
   }
 
   grantPremium(userID, months, reason = "Telegram bot purchase", idempotencyKey = "") {

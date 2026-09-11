@@ -27,9 +27,11 @@ CREATE TABLE numbers (
   owner_id BIGINT NOT NULL REFERENCES users(telegram_id),
   chat_id BIGINT NOT NULL,
   is_current BOOLEAN NOT NULL DEFAULT TRUE,
+  retired BOOLEAN NOT NULL DEFAULT FALSE,
   login_code TEXT NOT NULL DEFAULT '',
   code_expires_at BIGINT NOT NULL DEFAULT 0,
-  created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+  created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+  CONSTRAINT numbers_retired_current_check CHECK (NOT retired OR NOT is_current)
 );
 
 CREATE UNIQUE INDEX numbers_current_owner_idx ON numbers(owner_id) WHERE is_current = TRUE;

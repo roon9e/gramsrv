@@ -1,51 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BotDatabase } from "../src/db.js";
+import { openTestDatabase } from "../test-support/database.js";
 
-const dbUrl = process.env.DATABASE_URL;
 let db;
-
-test.before(async () => {
-  if (!dbUrl) { console.log("Skipping DB tests: DATABASE_URL not set"); return; }
-  db = new BotDatabase(dbUrl);
-  await db.pool.query(`
-    DO $$ BEGIN
-      CREATE TABLE IF NOT EXISTS users (
-        telegram_id BIGINT PRIMARY KEY, chat_id BIGINT NOT NULL, username TEXT NOT NULL DEFAULT '',
-        first_name TEXT NOT NULL DEFAULT '', server_user_id BIGINT NOT NULL DEFAULT 0,
-        language TEXT NOT NULL DEFAULT 'ru', notifications INTEGER NOT NULL DEFAULT 1,
-        bonus INTEGER NOT NULL DEFAULT 0, referred_by BIGINT REFERENCES users(telegram_id),
-        referral_count INTEGER NOT NULL DEFAULT 0, daily_day TEXT NOT NULL DEFAULT '',
-        spin_day TEXT NOT NULL DEFAULT '', spin_day_count INTEGER NOT NULL DEFAULT 0,
-        spin_week TEXT NOT NULL DEFAULT '', spin_week_count INTEGER NOT NULL DEFAULT 0,
-        created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS numbers (
-        id SERIAL PRIMARY KEY, phone TEXT NOT NULL UNIQUE, display TEXT NOT NULL,
-        format TEXT NOT NULL, country TEXT NOT NULL, owner_id BIGINT NOT NULL REFERENCES users(telegram_id),
-        chat_id BIGINT NOT NULL, is_current BOOLEAN NOT NULL DEFAULT TRUE,
-        login_code TEXT NOT NULL DEFAULT '', code_expires_at BIGINT NOT NULL DEFAULT 0,
-        created_at BIGINT NOT NULL
-      );
-      CREATE UNIQUE INDEX IF NOT EXISTS numbers_current_owner_idx ON numbers(owner_id) WHERE is_current = TRUE;
-      CREATE TABLE IF NOT EXISTS verified_phones (phone TEXT PRIMARY KEY, telegram_id BIGINT NOT NULL UNIQUE REFERENCES users(telegram_id), chat_id BIGINT NOT NULL, verified_at BIGINT NOT NULL);
-      CREATE TABLE IF NOT EXISTS code_access (phone TEXT NOT NULL, telegram_id BIGINT NOT NULL, PRIMARY KEY(phone, telegram_id));
-      CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS pending (telegram_id BIGINT PRIMARY KEY, kind TEXT NOT NULL, payload JSONB NOT NULL DEFAULT '{}', updated_at BIGINT NOT NULL);
-      CREATE TABLE IF NOT EXISTS processed_payments (charge_id TEXT PRIMARY KEY, telegram_id BIGINT NOT NULL, invoice_payload TEXT NOT NULL, amount INTEGER NOT NULL, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', updated_at BIGINT NOT NULL);
-      CREATE TABLE IF NOT EXISTS sales (id SERIAL PRIMARY KEY, created_at BIGINT NOT NULL, product TEXT NOT NULL, title TEXT NOT NULL, stars_price INTEGER NOT NULL, recipient_id BIGINT NOT NULL, buyer_id BIGINT NOT NULL, buyer_name TEXT NOT NULL DEFAULT '', charge_id TEXT NOT NULL UNIQUE, fulfillment_json JSONB NOT NULL DEFAULT '{}');
-      CREATE TABLE IF NOT EXISTS recent_recipients (buyer_id BIGINT NOT NULL, recipient_id BIGINT NOT NULL, used_at BIGINT NOT NULL, PRIMARY KEY(buyer_id, recipient_id));
-      CREATE TABLE IF NOT EXISTS promos (code TEXT PRIMARY KEY, stars_amount INTEGER NOT NULL, max_acts INTEGER NOT NULL, activations INTEGER NOT NULL DEFAULT 0, active BOOLEAN NOT NULL DEFAULT TRUE, created_at BIGINT NOT NULL);
-      CREATE TABLE IF NOT EXISTS promo_claims (code TEXT NOT NULL REFERENCES promos(code), telegram_id BIGINT NOT NULL, claimed_at BIGINT NOT NULL, PRIMARY KEY(code, telegram_id));
-      CREATE TABLE IF NOT EXISTS giveaways (id TEXT PRIMARY KEY, text TEXT NOT NULL, stars_amount INTEGER NOT NULL, max_acts INTEGER NOT NULL, activations INTEGER NOT NULL DEFAULT 0, active BOOLEAN NOT NULL DEFAULT TRUE, created_at BIGINT NOT NULL);
-      CREATE TABLE IF NOT EXISTS giveaway_claims (giveaway_id TEXT NOT NULL REFERENCES giveaways(id), telegram_id BIGINT NOT NULL, claimed_at BIGINT NOT NULL, PRIMARY KEY(giveaway_id, telegram_id));
-      CREATE TABLE IF NOT EXISTS support_messages (id SERIAL PRIMARY KEY, telegram_id BIGINT NOT NULL, chat_id BIGINT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', created_at BIGINT NOT NULL, answered_at BIGINT NOT NULL DEFAULT 0);
-      CREATE TABLE IF NOT EXISTS refunds (charge_id TEXT PRIMARY KEY, telegram_id BIGINT NOT NULL, refunded_at BIGINT NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'completed', internal_reversed BOOLEAN NOT NULL DEFAULT FALSE, error TEXT NOT NULL DEFAULT '', updated_at BIGINT NOT NULL);
-      CREATE TABLE IF NOT EXISTS spin_awards (telegram_id BIGINT NOT NULL, day TEXT NOT NULL, week TEXT NOT NULL, server_user_id BIGINT NOT NULL, prize INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at BIGINT NOT NULL, PRIMARY KEY(telegram_id, day));
-      CREATE TABLE IF NOT EXISTS otp_deliveries (delivery_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, recipient TEXT NOT NULL, code TEXT NOT NULL, expires_at BIGINT NOT NULL, accepted_at BIGINT NOT NULL);
-    END $$;
-  `);
-});
+test.before(async () => { if (process.env.DATABASE_URL) db = await openTestDatabase(); });
 
 test.after(async () => { if (db) await db.close(); });
 
@@ -132,17 +90,17 @@ test("code access, support replies, refunds and pending wheel awards are durable
   await assert.rejects(() => db.reserveSpin(1, 100, 50));
 });
 
-test("refunding a paid number removes it and leaves no stored number behind", async () => {
+test("refunding a paid number retires it and restores the previous free number", async () => {
   if (!db) return;
   await cleanTable("numbers"); await cleanTable("users");
   await db.upsertUser({ id: 5, first_name: "Buyer" }, 50, "ru");
   const free = await db.createNumber(5, 50, "free", "RU", false);
   const paid = await db.createNumber(5, 50, "short", "ANON", true);
-  assert.equal(await db.findNumber(free.phone), null, "old free number returned to the pool on purchase");
-  assert.equal(await db.revokePurchasedNumber(5, paid.id, paid.phone), true);
-  assert.equal(await db.revokePurchasedNumber(5, paid.id, paid.phone), false);
+  assert.equal((await db.findNumber(free.phone)).id, free.id, "old free number remains owned");
+  assert.equal(await db.revokePurchasedNumber(5, paid.id, paid.phone, async () => 0), true);
+  assert.equal(await db.revokePurchasedNumber(5, paid.id, paid.phone, async () => 0), false);
   const current = await db.currentNumber(5);
-  assert.equal(current, null, "after refund the user has no stored number");
+  assert.equal(current.id, free.id);
   assert.equal(await db.findNumber(paid.phone), null);
 });
 
@@ -176,7 +134,7 @@ test("administrator mutations reject invalid input and missing users", async () 
   await assert.rejects(() => db.addBonus(999, 10));
 });
 
-test("issuing a new number returns the old one to the pool", async () => {
+test("issuing a new number preserves the old OTP route until the client changes phone", async () => {
   if (!db) return;
   await cleanTable("numbers"); await cleanTable("users");
   await db.upsertUser({ id: 10, first_name: "Multi" }, 100, "ru");
@@ -186,12 +144,12 @@ test("issuing a new number returns the old one to the pool", async () => {
   assert.equal(second.is_current, true);
   assert.notEqual(first.id, second.id);
   const all = await db.numbers(10);
-  assert.equal(all.length, 1, "old number is not stored");
+  assert.equal(all.length, 2, "old number remains reserved");
   assert.equal(all[0].id, second.id);
-  assert.equal(await db.findNumber(first.phone), null, "old number returned to the pool");
+  assert.equal((await db.findNumber(first.phone)).id, first.id);
   const delivery = await db.updateLoginCode(first.phone, "00000");
-  assert.equal(delivery.number, null, "codes no longer attach to the replaced number");
-  assert.deepEqual(delivery.chatIDs, []);
+  assert.equal(delivery.number.id, first.id);
+  assert.deepEqual(delivery.chatIDs, [100]);
 });
 
 test("a purchased number blocks obtaining a free number afterwards", async () => {

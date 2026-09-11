@@ -5,7 +5,7 @@ independently from the main MTProto server; a bot outage cannot stop MTProto.
 
 ## Functionality
 
-- automatic persistent number and initial code on `/start` (random mode);
+- automatic persistent number on `/start` (random mode);
 - real-number mode: users bind their actual Telegram phone via contact sharing;
 - delivery and storage of real login codes through authenticated `POST /code`;
 - free replacement numbers and paid anonymous `+888` numbers (random mode);
@@ -153,13 +153,33 @@ Telegram without a proxy.
 
 **Random mode** (`BOT_MODE=random`, default):
 - Users receive a randomly generated phone number on `/start`.
-- Each Telegram user has at most one active number at a time.
+- Each Telegram user has one current number; previous free numbers remain reserved
+  and keep receiving codes until the user completes any client-side phone change.
+- Free-number reservations are limited to 10 per user; old numbers are not recycled.
 - Numbers persist across bot restarts.
 
 **Real mode** (`BOT_MODE=real`):
 - Users must bind their actual Telegram phone number via contact sharing.
 - Random number generation is rejected server-side.
 - The bound phone is stored in PostgreSQL and survives restarts.
+
+In both modes, purchasing a number only reserves it. Change an existing account's
+phone in your **signed-in client** and enter the verification code delivered by
+the bot. Neither manual account IDs nor owner phone-binding commands change the
+server account phone. Existing real-phone and free-number code routes are retained.
+
+Number purchases atomically record the allocation, sale and completed payment.
+For a stored number payment interrupted by a database/process failure, an owner
+can use `/retry_payment <charge_id>` without charging the customer again.
+Before refunding a number, change away from it in the client and wait for issued
+verification codes to expire. The bot requires a successful server lookup showing
+no account still uses it. Refunded numbers are retired permanently, never recycled.
+See [number lifecycle and verification invariants](NUMBER_LIFECYCLE.md).
+
+Existing PostgreSQL deployments must apply `db/migrations/001-number-retirement.sql`
+before upgrading (fresh deployments use the updated `db/init.sql`). Back up the
+database first. The migration does not repair unsafe pre-release ownership state.
+Local images use an allowlisted build context; `.env` is provided only at runtime.
 
 ### Production deployment (GHCR image)
 

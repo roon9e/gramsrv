@@ -10,12 +10,11 @@ import { describeProxy } from "./proxy.js";
 
 const config = loadConfig();
 const db = new BotDatabase(config.dbUrl);
+// Fail before opening the webhook or polling Telegram if the required schema
+// migration has not been applied. Runtime startup never repairs persisted data.
+await db.pool.query("SELECT retired FROM numbers LIMIT 0");
 const gramsrv = new GramsrvClient(config);
 const bot = createBot({ config, db, gramsrv });
-
-db.purgeStaleFreeNumbers().then((cleared) => {
-  if (cleared > 0) console.log(`Returned ${cleared} stale free numbers to the pool`);
-}).catch((error) => console.error("Failed to purge stale free numbers", error));
 
 function escapeHTML(value) { return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"); }
 function json(response, status, body) { response.writeHead(status, { "content-type": "application/json; charset=utf-8" }); response.end(JSON.stringify(body)); }
@@ -68,7 +67,8 @@ const server = http.createServer((request, response) => {
       }).catch((error) => {
         console.error("OTP webhook failed", error);
         const conflict = error.message === "IDEMPOTENCY_CONFLICT";
-        json(response, conflict ? 409 : 400, { accepted: false, error_code: conflict ? "IDEMPOTENCY_CONFLICT" : "JSON_INVALID", retryable: false });
+        const retired = error.message === "NUMBER_RETIRED";
+        json(response, conflict ? 409 : 400, { accepted: false, error_code: conflict ? "IDEMPOTENCY_CONFLICT" : retired ? "RECIPIENT_INVALID" : "JSON_INVALID", retryable: false });
       });
     } catch (error) {
       console.error("OTP webhook failed", error);

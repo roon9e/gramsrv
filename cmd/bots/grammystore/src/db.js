@@ -32,8 +32,9 @@ function generatedNumber(format, country) {
 }
 
 export class BotDatabase {
-  constructor(dbUrl) {
+  constructor(dbUrl, { generateNumber = generatedNumber } = {}) {
     this.pool = new pg.Pool({ connectionString: dbUrl, max: 10, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000 });
+    this.generateNumber = generateNumber;
     pg.types.setTypeParser(20, (val) => Number(val));
   }
 
@@ -71,7 +72,7 @@ export class BotDatabase {
           await client.query("UPDATE users SET referral_count = referral_count + 1, bonus = bonus + $1, updated_at = $2 WHERE telegram_id = $3", [referralBonus, now(), referrerID]);
         }
       }
-      return this.user(from.id);
+      return (await client.query("SELECT * FROM users WHERE telegram_id = $1", [from.id])).rows[0];
     });
   }
 
@@ -137,29 +138,38 @@ export class BotDatabase {
   }
 
   async createNumber(ownerID, chatID, format = "free", country = "RU", replace = false) {
-    return this.tx(async (client) => {
-      const current = (await client.query("SELECT * FROM numbers WHERE owner_id = $1 AND is_current = TRUE", [ownerID])).rows[0] ?? null;
-      if (current && !replace) return current;
-      if (current && current.format !== "free") throw new Error("account already has an active anonymous number");
-      if (current) {
-        await client.query("DELETE FROM code_access WHERE phone IN (SELECT phone FROM numbers WHERE owner_id = $1 AND format = 'free')", [ownerID]);
-        await client.query("DELETE FROM numbers WHERE owner_id = $1 AND format = 'free'", [ownerID]);
-      }
-      for (let attempt = 0; attempt < 400; attempt++) {
-        const generated = generatedNumber(format, country);
-        try {
-          const result = await client.query(
-            `INSERT INTO numbers(phone, display, format, country, owner_id, chat_id, is_current, login_code, code_expires_at, created_at)
-             VALUES($1, $2, $3, $4, $5, $6, TRUE, '', 0, $7) RETURNING *`,
-            [generated.phone, generated.display, format, generated.country, ownerID, chatID, now()]
-          );
-          return result.rows[0];
-        } catch (error) {
-          if (!String(error.message).includes("unique")) throw error;
-        }
-      }
-      throw new Error("could not generate a unique number");
-    });
+    return this.tx((client) => this.createNumberInTransaction(client, ownerID, chatID, format, country, replace));
+  }
+
+  async createNumberInTransaction(client, ownerID, chatID, format, country, replace) {
+    // Serialize allocations for one owner, including the first allocation.
+    const owner = await client.query("SELECT telegram_id FROM users WHERE telegram_id = $1 FOR UPDATE", [ownerID]);
+    if (!owner.rowCount) throw new Error("user not found");
+    const current = (await client.query("SELECT * FROM numbers WHERE owner_id = $1 AND is_current = TRUE", [ownerID])).rows[0] ?? null;
+    if (current && !replace) return current;
+    if (current && current.format !== "free") throw new Error("account already has an active anonymous number");
+    if (format === "free") {
+      const owned = (await client.query("SELECT count(*)::int n FROM numbers WHERE owner_id = $1 AND format = 'free'", [ownerID])).rows[0].n;
+      if (owned >= 10) throw new Error("free number reservation limit reached");
+    }
+    if (current) {
+      // Client-confirmed phone changes may not have finished yet. Keep the
+      // previous number reserved to this owner and its OTP route alive.
+      await client.query("UPDATE numbers SET is_current = FALSE WHERE id = $1", [current.id]);
+    }
+    for (let attempt = 0; attempt < 400; attempt++) {
+      const generated = this.generateNumber(format, country);
+      // Only phone collisions are retryable. A caught PostgreSQL unique
+      // violation would abort the transaction and poison the next attempt.
+      const result = await client.query(
+        `INSERT INTO numbers(phone, display, format, country, owner_id, chat_id, is_current, login_code, code_expires_at, created_at)
+         VALUES($1, $2, $3, $4, $5, $6, TRUE, '', 0, $7)
+         ON CONFLICT(phone) DO NOTHING RETURNING *`,
+        [generated.phone, generated.display, format, generated.country, ownerID, chatID, now()]
+      );
+      if (result.rowCount) return result.rows[0];
+    }
+    throw new Error("could not generate a unique number");
   }
 
   async currentNumber(ownerID) {
@@ -167,18 +177,13 @@ export class BotDatabase {
     return res.rows[0] ?? null;
   }
 
-  async purgeStaleFreeNumbers() {
-    const res = await this.pool.query("DELETE FROM numbers WHERE format = 'free' AND is_current = FALSE");
-    return res.rowCount;
-  }
-
   async numbers(ownerID) {
-    const res = await this.pool.query("SELECT * FROM numbers WHERE owner_id = $1 ORDER BY id DESC", [ownerID]);
+    const res = await this.pool.query("SELECT * FROM numbers WHERE owner_id = $1 AND retired = FALSE ORDER BY id DESC", [ownerID]);
     return res.rows;
   }
 
   async findNumber(phone) {
-    const res = await this.pool.query("SELECT * FROM numbers WHERE phone = $1 AND is_current = TRUE ORDER BY id DESC LIMIT 1", [normalizePhone(phone)]);
+    const res = await this.pool.query("SELECT * FROM numbers WHERE phone = $1 AND retired = FALSE", [normalizePhone(phone)]);
     return res.rows[0] ?? null;
   }
 
@@ -189,8 +194,10 @@ export class BotDatabase {
   async updateLoginCode(phone, code, expiresAt = now() + 300) {
     phone = normalizePhone(phone);
     return this.tx(async (client) => {
-      await client.query("UPDATE numbers SET login_code = $1, code_expires_at = $2 WHERE phone = $3 AND is_current = TRUE", [String(code), expiresAt, phone]);
-      const number = (await client.query("SELECT * FROM numbers WHERE phone = $1 AND is_current = TRUE ORDER BY id DESC LIMIT 1", [phone])).rows[0] ?? null;
+      const locked = (await client.query("SELECT * FROM numbers WHERE phone = $1 FOR UPDATE", [phone])).rows[0];
+      if (locked?.retired) throw new Error("NUMBER_RETIRED");
+      await client.query("UPDATE numbers SET login_code = $1, code_expires_at = GREATEST(code_expires_at, $2) WHERE phone = $3", [String(code), expiresAt, phone]);
+      const number = (await client.query("SELECT * FROM numbers WHERE phone = $1", [phone])).rows[0] ?? null;
       const access = (await client.query(
         "SELECT u.chat_id FROM code_access a JOIN users u ON u.telegram_id = a.telegram_id WHERE a.phone = $1", [phone]
       )).rows;
@@ -205,18 +212,23 @@ export class BotDatabase {
   async acceptLoginCodeDelivery(deliveryID, fingerprint, phone, code, expiresAt) {
     phone = normalizePhone(phone);
     return this.tx(async (client) => {
+      // Same lock as refund retirement: no code can be accepted between the
+      // expiry/remote-account checks and retirement. Duplicate IDs serialize too.
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`otp:${deliveryID}`]);
+      const locked = (await client.query("SELECT * FROM numbers WHERE phone = $1 FOR UPDATE", [phone])).rows[0];
+      if (locked?.retired) throw new Error("NUMBER_RETIRED");
       const existing = (await client.query("SELECT * FROM otp_deliveries WHERE delivery_id = $1", [deliveryID])).rows[0];
       if (existing) {
         if (existing.fingerprint !== fingerprint) throw new Error("IDEMPOTENCY_CONFLICT");
-        const number = (await client.query("SELECT * FROM numbers WHERE phone = $1 AND is_current = TRUE ORDER BY id DESC LIMIT 1", [existing.recipient])).rows[0] ?? null;
+        const number = (await client.query("SELECT * FROM numbers WHERE phone = $1 AND retired = FALSE", [existing.recipient])).rows[0] ?? null;
         return { duplicate: true, number, chatIDs: [] };
       }
       await client.query(
         "INSERT INTO otp_deliveries(delivery_id, fingerprint, recipient, code, expires_at, accepted_at) VALUES($1, $2, $3, $4, $5, $6)",
         [deliveryID, fingerprint, phone, String(code), expiresAt, now()]
       );
-      await client.query("UPDATE numbers SET login_code = $1, code_expires_at = $2 WHERE phone = $3 AND is_current = TRUE", [String(code), expiresAt, phone]);
-      const number = (await client.query("SELECT * FROM numbers WHERE phone = $1 AND is_current = TRUE ORDER BY id DESC LIMIT 1", [phone])).rows[0] ?? null;
+      await client.query("UPDATE numbers SET login_code = $1, code_expires_at = GREATEST(code_expires_at, $2) WHERE phone = $3", [String(code), expiresAt, phone]);
+      const number = (await client.query("SELECT * FROM numbers WHERE phone = $1", [phone])).rows[0] ?? null;
       const access = (await client.query(
         "SELECT u.chat_id FROM code_access a JOIN users u ON u.telegram_id = a.telegram_id WHERE a.phone = $1", [phone]
       )).rows;
@@ -232,13 +244,23 @@ export class BotDatabase {
     await this.pool.query("INSERT INTO code_access(phone, telegram_id) VALUES($1, $2) ON CONFLICT DO NOTHING", [normalizePhone(phone), telegramID]);
   }
 
-  async revokePurchasedNumber(ownerID, numberID, phone) {
+  async revokePurchasedNumber(ownerID, numberID, phone, resolveUserByPhone) {
+    if (typeof resolveUserByPhone !== "function") throw new Error("account lookup is required for number refunds");
     return this.tx(async (client) => {
-      const number = (await client.query("SELECT * FROM numbers WHERE id = $1 AND owner_id = $2 AND phone = $3", [numberID, ownerID, normalizePhone(phone)])).rows[0];
-      if (!number) return false;
+      await client.query("SELECT telegram_id FROM users WHERE telegram_id = $1 FOR UPDATE", [ownerID]);
+      const number = (await client.query("SELECT * FROM numbers WHERE id = $1 AND owner_id = $2 AND phone = $3 FOR UPDATE", [numberID, ownerID, normalizePhone(phone)])).rows[0];
+      if (!number) throw new Error("purchased number not found");
+      if (number.retired) return false;
       if (number.format === "free") throw new Error("the free number cannot be refunded");
+      if (number.code_expires_at > now()) throw new Error("number has unexpired verification codes; retry after they expire");
+      // A bounded read-only Admin API call while holding the number lock. A
+      // failure or an existing account keeps the original OTP route untouched.
+      if (await resolveUserByPhone(number.phone) !== 0) throw new Error("number is still bound; change it in the signed-in client before refunding");
       await client.query("DELETE FROM code_access WHERE phone = $1", [number.phone]);
-      await client.query("DELETE FROM numbers WHERE id = $1", [number.id]);
+      await client.query("UPDATE numbers SET retired = TRUE, is_current = FALSE, login_code = '', code_expires_at = 0 WHERE id = $1", [number.id]);
+      if (number.is_current) {
+        await client.query("UPDATE numbers SET is_current = TRUE WHERE id = (SELECT id FROM numbers WHERE owner_id = $1 AND format = 'free' AND retired = FALSE ORDER BY id DESC LIMIT 1)", [ownerID]);
+      }
       return true;
     });
   }
@@ -371,7 +393,9 @@ export class BotDatabase {
 
   async beginPayment(chargeID, telegramID, payload, amount) {
     return this.tx(async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`payment:${chargeID}`]);
       const row = (await client.query("SELECT * FROM processed_payments WHERE charge_id = $1", [chargeID])).rows[0];
+      if (row && (row.telegram_id !== telegramID || row.invoice_payload !== payload || row.amount !== amount)) throw new Error("IDEMPOTENCY_CONFLICT");
       if (row?.status === "done") return false;
       if (row?.status === "processing" && row.updated_at > now() - 300) return false;
       await client.query(
@@ -389,15 +413,42 @@ export class BotDatabase {
   }
 
   async failPayment(chargeID, error) {
-    await this.pool.query("UPDATE processed_payments SET status = 'failed', error = $1, updated_at = $2 WHERE charge_id = $3", [String(error).slice(0, 1000), now(), chargeID]);
+    await this.pool.query("UPDATE processed_payments SET status = 'failed', error = $1, updated_at = $2 WHERE charge_id = $3 AND status <> 'done'", [String(error).slice(0, 1000), now(), chargeID]);
   }
 
   async addSale(sale) {
-    await this.pool.query(
+    await this.insertSale(this.pool, sale);
+  }
+
+  async insertSale(client, sale) {
+    await client.query(
       `INSERT INTO sales(created_at, product, title, stars_price, recipient_id, buyer_id, buyer_name, charge_id, fulfillment_json)
        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING`,
       [now(), sale.product, sale.title, sale.starsPrice, sale.recipientID, sale.buyerID, sale.buyerName ?? "", sale.chargeID, JSON.stringify(sale.fulfillment ?? {})]
     );
+  }
+
+  async paymentByCharge(chargeID) {
+    return (await this.pool.query("SELECT * FROM processed_payments WHERE charge_id = $1", [chargeID])).rows[0] ?? null;
+  }
+
+  async fulfillNumberPurchase(sale, chatID, format) {
+    return this.tx(async (client) => {
+      const payment = (await client.query("SELECT * FROM processed_payments WHERE charge_id = $1 FOR UPDATE", [sale.chargeID])).rows[0];
+      if (!payment || payment.telegram_id !== sale.buyerID || payment.amount !== sale.starsPrice) throw new Error("IDEMPOTENCY_CONFLICT");
+      const existing = (await client.query("SELECT * FROM sales WHERE charge_id = $1", [sale.chargeID])).rows[0];
+      if (existing) {
+        if (existing.buyer_id !== sale.buyerID || existing.product !== sale.product || existing.stars_price !== sale.starsPrice) throw new Error("IDEMPOTENCY_CONFLICT");
+        const number = (await client.query("SELECT * FROM numbers WHERE id = $1 AND owner_id = $2", [existing.fulfillment_json.numberID, sale.buyerID])).rows[0];
+        if (!number) throw new Error("recorded purchased number is missing");
+        return number;
+      }
+      const number = await this.createNumberInTransaction(client, sale.buyerID, chatID, format, "ANON", true);
+      const fulfillment = { kind: "number", ownerID: sale.buyerID, numberID: number.id, phone: number.phone, format: number.format };
+      await this.insertSale(client, { ...sale, recipientID: sale.buyerID, fulfillment });
+      await client.query("UPDATE processed_payments SET status = 'done', error = '', updated_at = $1 WHERE charge_id = $2", [now(), sale.chargeID]);
+      return number;
+    });
   }
 
   async saleByCharge(chargeID) {

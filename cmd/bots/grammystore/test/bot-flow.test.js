@@ -44,7 +44,7 @@ function mockDb() {
     createNumber: async (ownerID, chatID, format = "free", country = "RU", replace = false) => {
       const existing = [...numbers.values()].find((n) => n.owner_id === ownerID && n.is_current);
       if (existing && !replace) return existing;
-      if (existing) numbers.delete(existing.id);
+      if (existing) existing.is_current = false;
       const id = numberSeq++;
       const phone = `+7999${String(id).padStart(7, "0")}`;
       const num = { id, phone, display: phone, format, country, owner_id: ownerID, chat_id: chatID, is_current: true, login_code: "12345", code_expires_at: 9999999999, created_at: 0 };
@@ -293,23 +293,24 @@ test("Account fetch reports when the phone has no account", async () => {
   assert.match(calls.find((call) => call.method === "answerCallbackQuery").payload.text, /не найден аккаунт/);
 });
 
-test("requesting a new free number replaces the old one and the old one gets no codes", async () => {
+test("requesting a new free number keeps the previous number and its OTP route", async () => {
   const { bot, calls, db } = fixture();
   await db.upsertUser({ id: 10, first_name: "User", language_code: "ru" }, 10, "ru");
   const first = await db.createNumber(10, 10, "free", "RU", false);
   await bot.handleUpdate(accountCallbackUpdate({ data: "numbers:new:RU" }));
   const owned = await db.numbers(10);
-  assert.equal(owned.length, 1, "only one number is stored");
-  assert.notEqual(owned[0].id, first.id, "the old number was replaced");
-  assert.equal(owned[0].is_current, true);
-  assert.equal(await db.findNumber(first.phone), null, "old number is no longer resolvable");
+  assert.equal(owned.length, 2);
+  const current = await db.currentNumber(10);
+  assert.notEqual(current.id, first.id);
+  assert.equal(current.is_current, true);
+  assert.equal((await db.findNumber(first.phone)).id, first.id);
   const delivery = await db.updateLoginCode(first.phone, "00000");
-  assert.equal(delivery.number, null, "codes no longer attach to the replaced number");
-  assert.deepEqual(delivery.chatIDs, []);
+  assert.equal(delivery.number.id, first.id);
+  assert.deepEqual(delivery.chatIDs, [10]);
   await bot.handleUpdate(accountCallbackUpdate({ data: "menu:numbers" }));
   const menu = calls.filter((call) => call.method === "editMessageText").at(-1);
-  assert.ok(menu.payload.text.includes(owned[0].display), "menu shows the new number");
-  assert.ok(!menu.payload.text.includes(first.display), "menu no longer shows the old number");
+  assert.ok(menu.payload.text.includes(current.display));
+  assert.ok(menu.payload.text.includes(first.display));
 });
 
 test("numbers menu hides the free number button after buying +888", async () => {
@@ -416,7 +417,7 @@ test("admin binds a phone to any telegram account", async () => {
   gramsrv.setPhone = async (serverID, phone) => { setPhoneCalls.push({ serverID, phone }); };
   await bot.handleUpdate(accountCallbackUpdate({ fromID: 777, chatID: 777, data: "admin:bindphone" }));
   await bot.handleUpdate(textUpdate({ fromID: 777, chatID: 777, text: "10 +79991234567" }));
-  assert.deepEqual(setPhoneCalls, [{ serverID: 424242, phone: "+79991234567" }]);
+  assert.deepEqual(setPhoneCalls, [], "admin binding changes delivery routing, not the server account phone");
   const sent = calls.filter((call) => call.method === "sendMessage" && call.payload.chat_id === 777).at(-1);
   assert.ok(sent);
   assert.match(sent.payload.text, /привязан|bound/i);
