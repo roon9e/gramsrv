@@ -181,6 +181,40 @@ test("a purchased number blocks obtaining a free number afterwards", async () =>
   assert.equal(freeNumbers.rowCount, 0);
 });
 
+test("retention detects owners of a free plus an active +888 and cleanup touches only free rows", async () => {
+  if (!db) return;
+  await cleanTable("numbers"); await cleanTable("users");
+  await db.upsertUser({ id: 12, first_name: "OnlyFree" }, 120, "ru");
+  await db.upsertUser({ id: 13, first_name: "OnlyPaid" }, 130, "ru");
+  await db.upsertUser({ id: 14, first_name: "Both" }, 140, "ru");
+  await db.upsertUser({ id: 15, first_name: "RetiredPaid" }, 150, "ru");
+  const insert = (phone, format, ownerID, chatID, isCurrent) => db.pool.query(
+    "INSERT INTO numbers(phone, display, format, country, owner_id, chat_id, is_current, retired) VALUES($1, $1, $2, $3, $4, $5, $6, FALSE) RETURNING *",
+    [phone, format, format === "free" ? "RU" : "ANON", ownerID, chatID, isCurrent]
+  ).then((res) => res.rows[0]);
+  const free12 = await insert("+88880000012", "free", 12, 120, true);
+  await insert("+88880900013", "short", 13, 130, true);
+  const free14 = await insert("+88880000014", "free", 14, 140, false);
+  const paid14 = await insert("+88880900014", "short", 14, 140, true);
+  await insert("+88880000015", "free", 15, 150, true);
+  const paid15 = await insert("+88880900015", "short", 15, 150, true);
+  await db.pool.query("UPDATE numbers SET retired = TRUE, is_current = FALSE WHERE id = $1", [paid15.id]);
+  assert.deepEqual(await db.duplicateNumberOwners(), [14]);
+  const cleaned = await db.cleanupFreeNumbers(14);
+  assert.equal(cleaned.removed, 1);
+  assert.equal(cleaned.keptPhone, paid14.phone);
+  const owned14 = await db.numbers(14);
+  assert.equal(owned14.length, 1, "exactly one number stays");
+  assert.equal(owned14[0].id, paid14.id, "the +888 survives");
+  assert.equal(owned14[0].is_current, true);
+  assert.equal(await db.findNumber(free14.phone), null, "the free number is released to the pool");
+  assert.equal((await db.findNumber(paid14.phone)).id, paid14.id);
+  assert.equal((await db.cleanupFreeNumbers(15)).removed, 0, "a free under a retired +888 is left alone");
+  assert.equal((await db.cleanupFreeNumbers(12)).removed, 0, "a free-only owner is left alone");
+  assert.equal((await db.cleanupFreeNumbers(13)).removed, 0, "a +888-only owner is left alone");
+  assert.equal((await db.findNumber(free12.phone)).id, free12.id);
+});
+
 test("verified phone binding and lookup", async () => {
   if (!db) return;
   await cleanTable("verified_phones"); await cleanTable("users");

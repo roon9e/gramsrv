@@ -271,6 +271,28 @@ export class BotDatabase {
     });
   }
 
+  async duplicateNumberOwners() {
+    const res = await this.pool.query(
+      `SELECT owner_id FROM numbers WHERE retired = FALSE
+       GROUP BY owner_id
+       HAVING bool_or(format = 'free') AND bool_or(format <> 'free')`
+    );
+    return res.rows.map((row) => row.owner_id);
+  }
+
+  async cleanupFreeNumbers(ownerID) {
+    return this.tx(async (client) => {
+      await client.query("SELECT telegram_id FROM users WHERE telegram_id = $1 FOR UPDATE", [ownerID]);
+      const purchased = (await client.query(
+        "SELECT * FROM numbers WHERE owner_id = $1 AND format <> 'free' AND retired = FALSE ORDER BY id DESC LIMIT 1", [ownerID]
+      )).rows[0] ?? null;
+      if (!purchased) return { removed: 0, keptPhone: null };
+      const deleted = await client.query("DELETE FROM numbers WHERE owner_id = $1 AND format = 'free'", [ownerID]);
+      if (deleted.rowCount > 0) await client.query("UPDATE numbers SET is_current = TRUE WHERE id = $1", [purchased.id]);
+      return { removed: deleted.rowCount, keptPhone: purchased.phone };
+    });
+  }
+
   async getSetting(key, fallback = "") {
     const res = await this.pool.query("SELECT value FROM settings WHERE key = $1", [key]);
     return res.rows[0]?.value ?? fallback;

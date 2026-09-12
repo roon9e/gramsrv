@@ -78,6 +78,40 @@ export async function executeCompensatedRefund({ sale, telegramID, db, gramsrv, 
   }
 }
 
+// Enforces the "one active number per Telegram account" invariant in the bot
+// DB. Any user that still owns a free number alongside a purchased +888 number
+// (left behind by earlier logic) gets the free number released back to the
+// pool; the +888 number is never touched. If the free number is already bound
+// to a server account ("signed up"), that account is rebound to the +888 first
+// so the release never strands the user's account phone.
+export async function runNumberRetention({ db, gramsrv, log = console }) {
+  const owners = await db.duplicateNumberOwners();
+  for (const ownerID of owners) {
+    try {
+      const owned = (await db.numbers(ownerID)) ?? [];
+      const frees = owned.filter((number) => number.format === "free");
+      const purchased = owned.find((number) => number.format !== "free");
+      if (!purchased || frees.length === 0) continue;
+      for (const free of frees) {
+        if (free.phone === purchased.phone) continue;
+        let accountID = 0;
+        try { accountID = await gramsrv.resolveUserByPhone(free.phone); }
+        catch (error) { log.error?.("Retention account lookup failed", ownerID, free.phone, error); }
+        if (accountID > 0) {
+          await gramsrv.setPhone(accountID, purchased.phone, "Retention rebind to purchased number", `retention:${ownerID}:${free.phone}:${purchased.phone}`);
+          log.log?.(`Rebound account ${accountID} from ${free.phone} to ${purchased.phone} (telegram ${ownerID})`);
+          break;
+        }
+      }
+      const result = await db.cleanupFreeNumbers(ownerID);
+      if (result.removed > 0) log.log?.(`Released ${result.removed} free number(s) for telegram ${ownerID}; kept ${result.keptPhone}`);
+    } catch (error) {
+      log.error?.("Number retention cleanup failed", ownerID, error);
+    }
+  }
+  return owners.length;
+}
+
 export function mainKeyboard(language, admin = false) {
   const kb = new InlineKeyboard()
     .text(translate(language, "buttonNumbers"), "menu:numbers").text(translate(language, "buttonShop"), "menu:shop").row()

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { openTestDatabase } from "../test-support/database.js";
-import { createBot, executeCompensatedRefund } from "../src/bot.js";
+import { createBot, executeCompensatedRefund, runNumberRetention } from "../src/bot.js";
 import { GramsrvClient } from "../src/gramsrv.js";
 import { buildPayload } from "../src/catalog.js";
 
@@ -42,6 +42,49 @@ function fixture(db, mode = "random") {
   const pay = (id, chargeID) => message(id, undefined, { successful_payment: { currency: "XTR", total_amount: 25, invoice_payload: buildPayload("num_long", 0), telegram_payment_charge_id: chargeID, provider_payment_charge_id: "test" } });
   return { bot, calls, requests, gramsrv, message, command, callback, pay };
 }
+
+databaseTest("retention rebinds a signed-up free number to the owned +888 before releasing it", async (db) => {
+  await user(db);
+  const stale = (await db.pool.query(
+    "INSERT INTO numbers(phone, display, format, country, owner_id, chat_id, is_current, retired) VALUES('+88880000001', '+88880000001', 'free', 'RU', 1, 1, FALSE, FALSE) RETURNING *"
+  )).rows[0];
+  const paid = (await db.pool.query(
+    "INSERT INTO numbers(phone, display, format, country, owner_id, chat_id, is_current, retired) VALUES('+88889900001', '+88889900001', 'long', 'ANON', 1, 1, TRUE, FALSE) RETURNING *"
+  )).rows[0];
+  const rebinds = [];
+  const result = await runNumberRetention({ db, gramsrv: {
+    resolveUserByPhone: async (phone) => (phone === stale.phone ? 424242 : 0),
+    setPhone: async (userID, phone, reason, key) => rebinds.push({ userID, phone, reason, key }),
+  }, log: { log() {}, error() {} } });
+  assert.equal(result, 1);
+  assert.deepEqual(rebinds, [{ userID: 424242, phone: paid.phone, reason: "Retention rebind to purchased number", key: `retention:1:${stale.phone}:${paid.phone}` }]);
+  const owned = await db.numbers(1);
+  assert.equal(owned.length, 1, "exactly one number after retention");
+  assert.equal(owned[0].id, paid.id, "the +888 survives");
+  assert.equal(owned[0].is_current, true);
+  assert.equal(await db.findNumber(stale.phone), null, "the stale free number is released to the pool");
+});
+
+databaseTest("retention releases an unsigned free number without touching gramsrv", async (db) => {
+  await user(db);
+  const stale = (await db.pool.query(
+    "INSERT INTO numbers(phone, display, format, country, owner_id, chat_id, is_current, retired) VALUES('+88880000002', '+88880000002', 'free', 'RU', 1, 1, FALSE, FALSE) RETURNING *"
+  )).rows[0];
+  const paid = (await db.pool.query(
+    "INSERT INTO numbers(phone, display, format, country, owner_id, chat_id, is_current, retired) VALUES('+88889900002', '+88889900002', 'long', 'ANON', 1, 1, TRUE, FALSE) RETURNING *"
+  )).rows[0];
+  let setPhoneCalls = 0;
+  const result = await runNumberRetention({ db, gramsrv: {
+    resolveUserByPhone: async () => 0,
+    setPhone: async () => { setPhoneCalls++; },
+  }, log: { log() {}, error() {} } });
+  assert.equal(result, 1);
+  assert.equal(setPhoneCalls, 0, "no rebind when the free number is not signed up");
+  const owned = await db.numbers(1);
+  assert.equal(owned.length, 1, "exactly one number after retention");
+  assert.equal(owned[0].id, paid.id, "the +888 survives");
+  assert.equal(await db.findNumber(stale.phone), null, "the stale free number is released to the pool");
+});
 
 databaseTest("manual account IDs never authorize server phone mutations on start, replacement or purchase", async (db) => {
   const f = fixture(db);
