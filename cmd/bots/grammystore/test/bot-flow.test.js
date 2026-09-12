@@ -49,6 +49,9 @@ function mockDb() {
       const phone = `+7999${String(id).padStart(7, "0")}`;
       const num = { id, phone, display: phone, format, country, owner_id: ownerID, chat_id: chatID, is_current: true, login_code: "12345", code_expires_at: 9999999999, created_at: 0 };
       numbers.set(id, num);
+      for (const n of [...numbers.values()]) {
+        if (n.owner_id === ownerID && n.format === "free" && n.id !== id) numbers.delete(n.id);
+      }
       return num;
     },
     currentNumber: async (ownerID) => [...numbers.values()].find((n) => n.owner_id === ownerID && n.is_current) ?? null,
@@ -293,24 +296,21 @@ test("Account fetch reports when the phone has no account", async () => {
   assert.match(calls.find((call) => call.method === "answerCallbackQuery").payload.text, /не найден аккаунт/);
 });
 
-test("requesting a new free number keeps the previous number and its OTP route", async () => {
+test("requesting a new free number replaces the previous number so exactly one remains", async () => {
   const { bot, calls, db } = fixture();
   await db.upsertUser({ id: 10, first_name: "User", language_code: "ru" }, 10, "ru");
   const first = await db.createNumber(10, 10, "free", "RU", false);
   await bot.handleUpdate(accountCallbackUpdate({ data: "numbers:new:RU" }));
   const owned = await db.numbers(10);
-  assert.equal(owned.length, 2);
+  assert.equal(owned.length, 1, "exactly one number is owned after a re-roll");
   const current = await db.currentNumber(10);
   assert.notEqual(current.id, first.id);
   assert.equal(current.is_current, true);
-  assert.equal((await db.findNumber(first.phone)).id, first.id);
-  const delivery = await db.updateLoginCode(first.phone, "00000");
-  assert.equal(delivery.number.id, first.id);
-  assert.deepEqual(delivery.chatIDs, [10]);
+  assert.equal(await db.findNumber(first.phone), null, "the previous number was released to the pool");
   await bot.handleUpdate(accountCallbackUpdate({ data: "menu:numbers" }));
   const menu = calls.filter((call) => call.method === "editMessageText").at(-1);
   assert.ok(menu.payload.text.includes(current.display));
-  assert.ok(menu.payload.text.includes(first.display));
+  assert.ok(!menu.payload.text.includes(first.display));
 });
 
 test("numbers menu hides the free number button after buying +888", async () => {

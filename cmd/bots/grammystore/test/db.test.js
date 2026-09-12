@@ -104,6 +104,24 @@ test("refunding a paid number retires it and restores the previous free number",
   assert.equal(await db.findNumber(paid.phone), null);
 });
 
+test("purchasing a number releases prior free numbers and a refund restores a fresh free number", async () => {
+  if (!db) return;
+  await cleanTable("numbers"); await cleanTable("users"); await cleanTable("sales"); await cleanTable("processed_payments");
+  await db.upsertUser({ id: 7, first_name: "Buyer" }, 70, "ru");
+  const free = await db.createNumber(7, 70, "free", "RU", false);
+  const paid = await db.fulfillNumberPurchase({ product: "num_short", title: "N", starsPrice: 50, recipientID: 7, buyerID: 7, buyerName: "Buyer", chargeID: "owner-test" }, 70, "short");
+  assert.notEqual(paid.id, free.id);
+  assert.equal(await db.findNumber(free.phone), null, "old free number is released to the pool");
+  const owned = await db.numbers(7);
+  assert.equal(owned.length, 1, "only the purchased number remains in the menu");
+  assert.equal(owned[0].id, paid.id);
+  assert.equal(await db.revokePurchasedNumber(7, paid.id, paid.phone, async () => 0), true);
+  const current = await db.currentNumber(7);
+  assert.notEqual(current.id, paid.id);
+  assert.equal(current.format, "free", "refund restores a fresh free number");
+  assert.equal(await db.findNumber(paid.phone), null);
+});
+
 test("language and notification preferences persist and broadcasts honor them", async () => {
   if (!db) return;
   await cleanTable("users");
@@ -134,7 +152,7 @@ test("administrator mutations reject invalid input and missing users", async () 
   await assert.rejects(() => db.addBonus(999, 10));
 });
 
-test("issuing a new number preserves the old OTP route until the client changes phone", async () => {
+test("re-rolling a free number replaces the previous one so exactly one remains", async () => {
   if (!db) return;
   await cleanTable("numbers"); await cleanTable("users");
   await db.upsertUser({ id: 10, first_name: "Multi" }, 100, "ru");
@@ -144,12 +162,9 @@ test("issuing a new number preserves the old OTP route until the client changes 
   assert.equal(second.is_current, true);
   assert.notEqual(first.id, second.id);
   const all = await db.numbers(10);
-  assert.equal(all.length, 2, "old number remains reserved");
+  assert.equal(all.length, 1, "exactly one number remains after a re-roll");
   assert.equal(all[0].id, second.id);
-  assert.equal((await db.findNumber(first.phone)).id, first.id);
-  const delivery = await db.updateLoginCode(first.phone, "00000");
-  assert.equal(delivery.number.id, first.id);
-  assert.deepEqual(delivery.chatIDs, [100]);
+  assert.equal(await db.findNumber(first.phone), null, "the previous number was released to the pool");
 });
 
 test("a purchased number blocks obtaining a free number afterwards", async () => {

@@ -148,13 +148,10 @@ export class BotDatabase {
     const current = (await client.query("SELECT * FROM numbers WHERE owner_id = $1 AND is_current = TRUE", [ownerID])).rows[0] ?? null;
     if (current && !replace) return current;
     if (current && current.format !== "free") throw new Error("account already has an active anonymous number");
-    if (format === "free") {
-      const owned = (await client.query("SELECT count(*)::int n FROM numbers WHERE owner_id = $1 AND format = 'free'", [ownerID])).rows[0].n;
-      if (owned >= 10) throw new Error("free number reservation limit reached");
-    }
     if (current) {
-      // Client-confirmed phone changes may not have finished yet. Keep the
-      // previous number reserved to this owner and its OTP route alive.
+      // The previous number is released to the pool when the replacement
+      // commits (see the DELETE below); the demote keeps the unique
+      // one-current-per-owner index consistent inside the transaction.
       await client.query("UPDATE numbers SET is_current = FALSE WHERE id = $1", [current.id]);
     }
     for (let attempt = 0; attempt < 400; attempt++) {
@@ -167,7 +164,14 @@ export class BotDatabase {
          ON CONFLICT(phone) DO NOTHING RETURNING *`,
         [generated.phone, generated.display, format, generated.country, ownerID, chatID, now()]
       );
-      if (result.rowCount) return result.rows[0];
+      if (result.rowCount) {
+        // Enforce a single active number per owner: any previously owned free
+        // numbers (reserved by earlier re-rolls or the free allocation) are
+        // released to the pool. Runs after the insert so failed allocations
+        // roll back the whole replacement and preserve the previous number.
+        await client.query("DELETE FROM numbers WHERE owner_id = $1 AND format = 'free' AND id <> $2", [ownerID, result.rows[0].id]);
+        return result.rows[0];
+      }
     }
     throw new Error("could not generate a unique number");
   }
@@ -247,7 +251,8 @@ export class BotDatabase {
   async revokePurchasedNumber(ownerID, numberID, phone, resolveUserByPhone) {
     if (typeof resolveUserByPhone !== "function") throw new Error("account lookup is required for number refunds");
     return this.tx(async (client) => {
-      await client.query("SELECT telegram_id FROM users WHERE telegram_id = $1 FOR UPDATE", [ownerID]);
+      const user = (await client.query("SELECT telegram_id, chat_id FROM users WHERE telegram_id = $1 FOR UPDATE", [ownerID])).rows[0];
+      if (!user) throw new Error("owner not found");
       const number = (await client.query("SELECT * FROM numbers WHERE id = $1 AND owner_id = $2 AND phone = $3 FOR UPDATE", [numberID, ownerID, normalizePhone(phone)])).rows[0];
       if (!number) throw new Error("purchased number not found");
       if (number.retired) return false;
@@ -259,7 +264,8 @@ export class BotDatabase {
       await client.query("DELETE FROM code_access WHERE phone = $1", [number.phone]);
       await client.query("UPDATE numbers SET retired = TRUE, is_current = FALSE, login_code = '', code_expires_at = 0 WHERE id = $1", [number.id]);
       if (number.is_current) {
-        await client.query("UPDATE numbers SET is_current = TRUE WHERE id = (SELECT id FROM numbers WHERE owner_id = $1 AND format = 'free' AND retired = FALSE ORDER BY id DESC LIMIT 1)", [ownerID]);
+        const restored = await client.query("UPDATE numbers SET is_current = TRUE WHERE id = (SELECT id FROM numbers WHERE owner_id = $1 AND format = 'free' AND retired = FALSE ORDER BY id DESC LIMIT 1) RETURNING id", [ownerID]);
+        if (restored.rowCount === 0) await this.createNumberInTransaction(client, ownerID, user.chat_id, "free", "RU", false);
       }
       return true;
     });
@@ -434,8 +440,9 @@ export class BotDatabase {
 
   async fulfillNumberPurchase(sale, chatID, format) {
     return this.tx(async (client) => {
+      const ownerGrant = sale.chargeID.startsWith("owner-");
       const payment = (await client.query("SELECT * FROM processed_payments WHERE charge_id = $1 FOR UPDATE", [sale.chargeID])).rows[0];
-      if (!payment || payment.telegram_id !== sale.buyerID || payment.amount !== sale.starsPrice) throw new Error("IDEMPOTENCY_CONFLICT");
+      if (!ownerGrant && (!payment || payment.telegram_id !== sale.buyerID || payment.amount !== sale.starsPrice)) throw new Error("IDEMPOTENCY_CONFLICT");
       const existing = (await client.query("SELECT * FROM sales WHERE charge_id = $1", [sale.chargeID])).rows[0];
       if (existing) {
         if (existing.buyer_id !== sale.buyerID || existing.product !== sale.product || existing.stars_price !== sale.starsPrice) throw new Error("IDEMPOTENCY_CONFLICT");

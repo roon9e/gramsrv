@@ -351,7 +351,18 @@ export function createBot({ config, db, gramsrv }) {
     } else if (product.kind === KINDS.number) {
       recipientID = buyer.id;
       const view = localized(buyer.id, product);
+      const account = await db.user(buyer.id);
+      const previous = await db.currentNumber(buyer.id);
+      let accountID = 0;
+      if (account?.server_user_id > 0 && previous?.phone) {
+        const resolved = await gramsrv.resolveUserByPhone(previous.phone).catch(() => 0);
+        if (resolved === account.server_user_id) accountID = resolved;
+      }
       number = await db.fulfillNumberPurchase({ product: product.code, title: view.title, starsPrice: product.starsPrice, recipientID, buyerID: buyer.id, buyerName: userName(buyer), chargeID }, chatID, product.numberFormat);
+      if (number && accountID > 0) {
+        try { await gramsrv.setPhone(accountID, number.phone, "Telegram bot number purchase", key); }
+        catch (error) { console.error("Failed to set server phone for number purchase", accountID, error); }
+      }
     } else throw new Error("unknown product kind");
     const productView = localized(buyer.id, product);
     if (!number) await db.addSale({ product: product.code, title: productView.title, starsPrice: product.starsPrice, recipientID, buyerID: buyer.id, buyerName: userName(buyer), chargeID, fulfillment });
@@ -584,7 +595,7 @@ export function createBot({ config, db, gramsrv }) {
       db._userCache.set(ctx.from.id, await db.user(ctx.from.id));
       const message = tr(ctx.from.id, "accountSaved", { id: serverUserID });
       await ctx.answerCallbackQuery({ text: message });
-      return editOrReply(ctx, message, mainKeyboard(language, isOwner(config, ctx.from.id)));
+      return editOrReply(ctx, tr(ctx.from.id, "menuTitle"), mainKeyboard(language, isOwner(config, ctx.from.id)));
     } catch (error) {
       console.error("Account fetch failed", error);
       const text = String(error?.message ?? "").startsWith("gramsrv ")
