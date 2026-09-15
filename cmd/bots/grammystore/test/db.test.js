@@ -67,9 +67,18 @@ test("code access, support replies, refunds and pending wheel awards are durable
   const ticket = await db.addSupportMessage(1, 10, "help");
   const msg = await db.supportMessage(ticket);
   assert.equal(msg.status, "open");
-  await db.closeSupportMessage(ticket);
+  await db.closeSupportMessage(ticket, 777, "restart your server");
   const closed = await db.supportMessage(ticket);
   assert.equal(closed.status, "answered");
+  assert.equal(closed.answered_by, 777);
+  assert.equal(closed.answer, "restart your server");
+  assert.equal(await db.rateSupportTicket(ticket, 5, 1), true);
+  assert.equal(await db.rateSupportTicket(ticket, 3, 1), false, "a duplicate rating is rejected");
+  assert.equal(await db.rateSupportTicket(ticket, 4, 2), false, "another user cannot rate the ticket");
+  const ratings = await db.recentSupportRatings(10);
+  assert.equal(ratings.length, 1);
+  assert.equal(ratings[0].rating, 5);
+  assert.equal(ratings[0].answered_by, 777);
 
   await db.addSale({ product: "stars_1", title: "20 Stars", starsPrice: 1, recipientID: 100, buyerID: 1, buyerName: "Owner", chargeID: "charge-refund", fulfillment: { kind: "stars", recipientID: 100, amount: 20 } });
   const sale = await db.saleByCharge("charge-refund");
