@@ -192,8 +192,9 @@ Existing PostgreSQL deployments must apply `db/migrations/001-number-retirement.
 `db/migrations/002-refund-provider-charge.sql`,
 `db/migrations/003-users-server-user-id-unique.sql`,
 `db/migrations/004-number-offers.sql`,
-`db/migrations/005-drop-number-offers.sql` and
-`db/migrations/006-free-number-daily-limit.sql`
+`db/migrations/005-drop-number-offers.sql`,
+`db/migrations/006-free-number-daily-limit.sql` and
+`db/migrations/007-support-tickets-extended.sql`
 before upgrading (fresh deployments use the updated `db/init.sql`). Back up the
 database first. The migration does not repair unsafe pre-release ownership state.
 Local images use an allowlisted build context; `.env` is provided only at runtime.
