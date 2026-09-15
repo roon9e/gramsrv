@@ -1569,6 +1569,13 @@ func (r *Router) onAccountCheckUsername(ctx context.Context, username string) (b
 	}
 	okUsername, err := svc.CheckUsername(ctx, userID, username)
 	if err != nil {
+		// account.checkUsername is a query: invalid or occupied usernames are
+		// answered with boolFalse instead of a hard RPC error. Clients poll it
+		// on every keystroke while editing a username and treat the error and
+		// the false result identically, so failing the RPC only adds log noise.
+		if errors.Is(err, domain.ErrUsernameInvalid) || errors.Is(err, domain.ErrUsernameOccupied) {
+			return false, nil
+		}
 		return false, usernameErr(err)
 	}
 	return okUsername, nil
