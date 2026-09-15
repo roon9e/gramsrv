@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { openTestDatabase } from "../test-support/database.js";
+import { applyMigrations } from "../db/migrate.js";
 
 let db;
 test.before(async () => { if (process.env.DATABASE_URL) db = await openTestDatabase(); });
@@ -357,4 +358,16 @@ test("admin exact lookups return correct data", async () => {
   assert.equal(byPhone.owner.telegram_id, 30);
   assert.equal(await db.adminLookupByTelegramID(999), null);
   assert.equal(await db.adminLookupByNumber("+9990000000000"), null);
+});
+
+test("startup migrations are idempotent and cover the latest schema", async () => {
+  if (!db) return;
+  const first = await applyMigrations();
+  const second = await applyMigrations();
+  assert.deepEqual(second, first);
+  assert.ok(first.includes("007-support-tickets-extended.sql"));
+  const rating = await db.pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'support_ratings' AND column_name = 'rating'`);
+  assert.equal(rating.rowCount, 1);
+  const answeredBy = await db.pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'support_messages' AND column_name = 'answered_by'`);
+  assert.equal(answeredBy.rowCount, 1);
 });
