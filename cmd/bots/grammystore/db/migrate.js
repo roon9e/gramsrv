@@ -13,12 +13,12 @@ import { databaseURL } from "../src/config.js";
 
 const migrationsDir = join(fileURLToPath(new URL(".", import.meta.url)), "migrations");
 
-export async function applyMigrations() {
+export async function applyMigrations(connectionString = databaseURL()) {
   const files = (await readdir(migrationsDir))
     .filter((name) => /^\d{3}-.+\.sql$/.test(name))
     .sort();
   if (!files.length) return [];
-  const pool = new pg.Pool({ connectionString: databaseURL() });
+  const pool = new pg.Pool({ connectionString });
   try {
     const applied = [];
     for (const file of files) {

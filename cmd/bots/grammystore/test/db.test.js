@@ -362,12 +362,12 @@ test("admin exact lookups return correct data", async () => {
 
 test("startup migrations are idempotent and cover the latest schema", async () => {
   if (!db) return;
-  const first = await applyMigrations();
-  const second = await applyMigrations();
+  const first = await applyMigrations(db.connectionString);
+  const second = await applyMigrations(db.connectionString);
   assert.deepEqual(second, first);
   assert.ok(first.includes("007-support-tickets-extended.sql"));
-  const rating = await db.pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'support_ratings' AND column_name = 'rating'`);
+  const rating = await db.pool.query(`SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'support_ratings' AND column_name = 'rating'`);
   assert.equal(rating.rowCount, 1);
-  const answeredBy = await db.pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'support_messages' AND column_name = 'answered_by'`);
+  const answeredBy = await db.pool.query(`SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'support_messages' AND column_name = 'answered_by'`);
   assert.equal(answeredBy.rowCount, 1);
 });
