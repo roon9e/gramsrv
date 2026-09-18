@@ -498,7 +498,7 @@ func (s *Service) VerifierSettingsBatch(ctx context.Context, botIDs []int64) (ma
 //     exists at one caller is a check that will eventually be bypassed;
 //  3. the target peer exists and is verifiable at all.
 //
-// The description is resolved through domain.BotVerifierSettings.DescriptionFor,
+// The description is resolved through domain.VerifierOrganization.DescriptionFor,
 // which is the single place the "may this verifier write its own text" rule lives,
 // and the icon always comes from the verifier's *settings* -- a verifier cannot
 // pick an icon per peer, so it cannot smuggle in one the operator never approved.
@@ -516,7 +516,7 @@ func (s *Service) SetCustomVerification(ctx context.Context, req domain.SetCusto
 	if err := req.Validate(); err != nil {
 		return false, err
 	}
-	settings, err := s.enabledVerifier(ctx, st, req.VerifierBotID)
+	org, err := s.resolveEnabledOrganization(ctx, st, req.VerifierBotID, req.OrganizationID)
 	if err != nil {
 		return false, err
 	}
@@ -540,7 +540,7 @@ func (s *Service) SetCustomVerification(ctx context.Context, req domain.SetCusto
 	if _, err := s.resolvePeer(ctx, req.Peer); err != nil {
 		return false, err
 	}
-	description, err := settings.DescriptionFor(req.CustomDescription)
+	description, err := org.DescriptionFor(req.CustomDescription)
 	if err != nil {
 		return false, err
 	}
@@ -553,16 +553,17 @@ func (s *Service) SetCustomVerification(ctx context.Context, req domain.SetCusto
 		return false, err
 	}
 	if exists {
-		if existing.IconDocumentID == settings.IconDocumentID && existing.Description == description {
+		if existing.IconDocumentID == org.IconDocumentID && existing.Description == description {
 			return false, nil
 		}
 	} else if err := s.checkVerifierQuota(ctx, st, req.VerifierBotID); err != nil {
 		return false, err
 	}
 	if _, _, err := st.GrantCustomVerification(ctx, domain.CustomVerification{
+		OrganizationID:  org.ID,
 		VerifierBotID:   req.VerifierBotID,
 		Peer:            req.Peer,
-		IconDocumentID:  settings.IconDocumentID,
+		IconDocumentID:  org.IconDocumentID,
 		Description:     description,
 		GrantedByUserID: req.CallerUserID,
 	}); err != nil {
@@ -817,7 +818,7 @@ func (s *Service) CreateRequest(ctx context.Context, req domain.CustomVerificati
 	if err := req.Validate(); err != nil {
 		return domain.CustomVerificationRequest{}, err
 	}
-	settings, err := s.enabledVerifier(ctx, st, req.VerifierBotID)
+	settings, err := s.resolveEnabledOrganization(ctx, st, req.VerifierBotID, req.OrganizationID)
 	if err != nil {
 		return domain.CustomVerificationRequest{}, err
 	}
@@ -854,6 +855,7 @@ func (s *Service) CreateRequest(ctx context.Context, req domain.CustomVerificati
 	req.Peer = snapshot.peer
 	req.PeerTitle = snapshot.title
 	req.PeerUsername = snapshot.username
+	req.OrganizationID = settings.ID
 	return st.CreateCustomVerificationRequest(ctx, req)
 }
 
@@ -946,7 +948,7 @@ func (s *Service) Approve(ctx context.Context, requestID, version int64, decided
 	if current.Status == domain.CustomVerificationApproved {
 		return current, false, nil
 	}
-	settings, err := s.enabledVerifier(ctx, st, current.VerifierBotID)
+	org, err := s.resolveEnabledOrganization(ctx, st, current.VerifierBotID, current.OrganizationID)
 	if err != nil {
 		return domain.CustomVerificationRequest{}, false, err
 	}
@@ -962,7 +964,7 @@ func (s *Service) Approve(ctx context.Context, requestID, version int64, decided
 			return domain.CustomVerificationRequest{}, false, err
 		}
 	}
-	description := s.approvedDescription(settings, current.RequestedDescription)
+	description := s.approvedDescription(org, current.RequestedDescription)
 	applier := s.markApplier(st)
 	stored, changed, err := st.DecideCustomVerificationRequest(ctx, requestID, version, domain.CustomVerificationApproved, decidedBy, reason, note,
 		// The callback's ctx carries the decision's transaction, so the grant is
@@ -970,10 +972,11 @@ func (s *Service) Approve(ctx context.Context, requestID, version int64, decided
 		// approval have to land or fail together.
 		func(ctx context.Context, decided domain.CustomVerificationRequest) error {
 			_, _, err := applier.GrantCustomVerification(ctx, domain.CustomVerification{
-				VerifierBotID:  decided.VerifierBotID,
-				Peer:           decided.Peer,
-				IconDocumentID: settings.IconDocumentID,
-				Description:    description,
+				OrganizationID:  org.ID,
+				VerifierBotID:   decided.VerifierBotID,
+				Peer:            decided.Peer,
+				IconDocumentID:  org.IconDocumentID,
+				Description:     description,
 				// The grant is attributed to the verifier bot: the decision was made
 				// through its queue, not by the applicant who filed it.
 				GrantedByUserID: decided.VerifierBotID,
@@ -1063,31 +1066,73 @@ func (s *Service) RevokeRequest(ctx context.Context, requestID, version int64, d
 // Checks
 // ---------------------------------------------------------------------------
 
-// enabledVerifier resolves a bot's live verifier status.
+// resolveEnabledOrganization resolves the enabled organization a grant or
+// application runs against: an explicit id must name one the bot hosts, a zero id
+// means the bot's primary organization.
 //
-// "No row" and "switched off" both answer domain.ErrVerifierForbidden, which is
-// what the TL edge reports as BOT_VERIFIER_FORBIDDEN: a caller must not be able to
-// tell from the error whether a bot was ever a verifier. A stored row that no
-// longer validates is refused too -- it could only produce a mark clients cannot
-// render.
-func (s *Service) enabledVerifier(ctx context.Context, st Store, botID int64) (domain.BotVerifierSettings, error) {
-	if botID <= 0 {
-		return domain.BotVerifierSettings{}, domain.ErrVerifierForbidden
+// The enabled gate is the same on every write path: "no org" and "switched off"
+// both answer domain.ErrVerifierForbidden, which is what the TL edge reports as
+// BOT_VERIFIER_FORBIDDEN -- a caller must not be able to tell from the error
+// whether a bot was ever a verifier. A stored row that no longer validates is
+// refused too, since it could only produce a mark clients cannot render.
+func (s *Service) resolveEnabledOrganization(ctx context.Context, st Store, verifierBotID, organizationID int64) (domain.VerifierOrganization, error) {
+	if verifierBotID <= 0 {
+		return domain.VerifierOrganization{}, domain.ErrVerifierForbidden
 	}
-	settings, err := st.BotVerifierSettings(ctx, botID)
+	if organizationID != 0 {
+		org, err := st.VerifierOrganization(ctx, organizationID)
+		if err != nil {
+			if errors.Is(err, domain.ErrOrganizationNotFound) || errors.Is(err, domain.ErrVerifierNotFound) {
+				return domain.VerifierOrganization{}, domain.ErrVerifierForbidden
+			}
+			return domain.VerifierOrganization{}, err
+		}
+		if org.VerifierBotID != verifierBotID {
+			return domain.VerifierOrganization{}, domain.ErrVerifierForbidden
+		}
+		org = s.enforceEnabledOrganization(org)
+		return org, orgErr(org)
+	}
+	orgs, err := st.VerifierOrganizationsByBot(ctx, verifierBotID, false)
 	if err != nil {
 		if errors.Is(err, domain.ErrVerifierNotFound) {
-			return domain.BotVerifierSettings{}, domain.ErrVerifierForbidden
+			return domain.VerifierOrganization{}, domain.ErrVerifierForbidden
 		}
-		return domain.BotVerifierSettings{}, err
+		return domain.VerifierOrganization{}, err
 	}
-	if settings.BotID != botID || !settings.Enabled {
-		return domain.BotVerifierSettings{}, domain.ErrVerifierForbidden
+	org := primaryOrganizationOf(orgs)
+	org = s.enforceEnabledOrganization(org)
+	return org, orgErr(org)
+}
+
+// enforceEnabledOrganization applies the kill switch: only an enabled
+// organization may grant, and a row that no longer validates cannot produce a
+// mark clients can render.
+func (s *Service) enforceEnabledOrganization(org domain.VerifierOrganization) domain.VerifierOrganization {
+	if org.ID <= 0 || !org.Enabled {
+		return domain.VerifierOrganization{}
 	}
-	if err := settings.Validate(); err != nil {
-		return domain.BotVerifierSettings{}, err
+	return org
+}
+
+// orgErr turns a blanked organization into the caller-facing error.
+func orgErr(org domain.VerifierOrganization) error {
+	if org.ID <= 0 {
+		return domain.ErrVerifierForbidden
 	}
-	return settings, nil
+	if err := org.Validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// primaryOrganizationOf picks the primary organization of a ranked list, which
+// the store orders by display_priority so the first entry is the primary.
+func primaryOrganizationOf(orgs []domain.VerifierOrganization) domain.VerifierOrganization {
+	if len(orgs) == 0 {
+		return domain.VerifierOrganization{}
+	}
+	return orgs[0]
 }
 
 // checkVerifierCaller asserts that the caller may act as this verifier bot: it is
@@ -1300,7 +1345,7 @@ func (s *Service) decidableRequest(ctx context.Context, st Store, requestID, ver
 // application was filed, the operator default is applied instead. Refusing the
 // approval would be worse: the application would be stuck in a state no reviewer
 // could clear, over a permission the applicant never controlled.
-func (s *Service) approvedDescription(settings domain.BotVerifierSettings, requested string) string {
+func (s *Service) approvedDescription(settings domain.VerifierOrganization, requested string) string {
 	description, err := settings.DescriptionFor(requested)
 	if err == nil {
 		return description

@@ -2588,23 +2588,32 @@ type CustomVerificationRequestDetail struct {
 	MarkActive bool
 }
 
-const botVerifierSelectColumns = `s.bot_id,
+const botVerifierSelectColumns = `s.verifier_bot_id,
 	COALESCE(NULLIF(u.username, ''), p.username_lower, '') AS bot_username,
 	TRIM(BOTH ' ' FROM COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS bot_name,
 	s.icon_document_id, COALESCE(i.name, '') AS icon_name,
 	s.company_name, s.default_description, s.can_modify_custom_description,
 	s.enabled, s.granted_by, s.grant_reason,
-	(SELECT count(*) FROM custom_verifications cv WHERE cv.verifier_bot_id = s.bot_id) AS mark_count,
+	(SELECT count(*) FROM custom_verifications cv WHERE cv.verifier_bot_id = s.verifier_bot_id) AS mark_count,
 	s.created_at, s.updated_at, s.version`
 
 // botVerifierJoins resolves the bot account behind the verifier row and the
 // catalogue label of its icon. The icon join is by document id, not by catalogue
 // id: the settings row stores the document, and an icon dropped from the catalogue
 // must still leave the verifier readable.
+//
+// The outer row is the bot's PRIMARY organization (lowest display_priority, then
+// oldest row), which is the shape the legacy per-bot panel renders: everything
+// else a bot's other organizations carry is visible through its organization
+// editor instead.
 const botVerifierJoins = `
-FROM bot_verifier_settings s
-LEFT JOIN users u ON u.id = s.bot_id
-LEFT JOIN peer_usernames p ON p.peer_type = 'user' AND p.peer_id = s.bot_id AND p.editable
+FROM (
+	SELECT DISTINCT ON (o.verifier_bot_id) o.*
+	FROM verifier_organizations o
+	ORDER BY o.verifier_bot_id, o.display_priority, o.id
+) s
+LEFT JOIN users u ON u.id = s.verifier_bot_id
+LEFT JOIN peer_usernames p ON p.peer_type = 'user' AND p.peer_id = s.verifier_bot_id AND p.editable
 LEFT JOIN verification_icons i ON i.document_id = s.icon_document_id`
 
 func scanBotVerifierRow(scan func(dest ...any) error, item *BotVerifierRow) error {
@@ -2624,7 +2633,7 @@ func (s *readStore) ListBotVerifiers(ctx context.Context, enabledOnly bool, limi
 	rows, err := s.pool.Query(ctx, `
 SELECT `+botVerifierSelectColumns+botVerifierJoins+`
 WHERE NOT $1::boolean OR s.enabled
-ORDER BY s.bot_id
+ORDER BY s.verifier_bot_id
 LIMIT $2`, enabledOnly, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list bot verifiers: %w", err)
@@ -2647,7 +2656,7 @@ func (s *readStore) BotVerifier(ctx context.Context, botID int64) (BotVerifierRo
 	var out BotVerifierRow
 	row := s.pool.QueryRow(ctx, `
 SELECT `+botVerifierSelectColumns+botVerifierJoins+`
-WHERE s.bot_id = $1`, botID)
+WHERE s.verifier_bot_id = $1`, botID)
 	// The single-row path reuses the list scanner, so one column order serves both:
 	// a drift between them would silently mis-assign columns.
 	if err := scanBotVerifierRow(row.Scan, &out); err != nil {
@@ -2668,7 +2677,7 @@ func (s *readStore) ListVerificationIcons(ctx context.Context, activeOnly bool, 
 SELECT i.id, i.document_id, i.owner_bot_id,
 	COALESCE(NULLIF(u.username, ''), p.username_lower, '') AS owner_bot_username,
 	i.name, i.active,
-	(SELECT count(*) FROM bot_verifier_settings s WHERE s.icon_document_id = i.document_id) AS used_by_verifiers,
+	(SELECT count(DISTINCT s.verifier_bot_id) FROM verifier_organizations s WHERE s.icon_document_id = i.document_id) AS used_by_verifiers,
 	i.created_at, i.updated_at
 FROM verification_icons i
 LEFT JOIN users u ON i.owner_bot_id <> 0 AND u.id = i.owner_bot_id
@@ -2739,7 +2748,7 @@ SELECT cv.id, cv.verifier_bot_id,
 FROM custom_verifications cv
 LEFT JOIN users vu ON vu.id = cv.verifier_bot_id
 LEFT JOIN peer_usernames vp ON vp.peer_type = 'user' AND vp.peer_id = cv.verifier_bot_id AND vp.editable
-LEFT JOIN bot_verifier_settings s ON s.bot_id = cv.verifier_bot_id`+
+LEFT JOIN verifier_organizations s ON s.id = cv.organization_id`+
 		fmt.Sprintf(customVerificationPeerJoins, "cv")+`
 WHERE ($1::bigint = 0 OR cv.verifier_bot_id = $1)
 	AND ($2::text = '' OR cv.peer_type = $2)

@@ -38,7 +38,7 @@ WHERE verifier_bot_id = $1 OR applicant_user_id = $1`, id)
 		_, _ = pool.Exec(cleanupCtx, `
 DELETE FROM custom_verifications WHERE verifier_bot_id = $1`, id)
 		_, _ = pool.Exec(cleanupCtx, `
-DELETE FROM bot_verifier_settings WHERE bot_id = $1`, id)
+DELETE FROM verifier_organizations WHERE verifier_bot_id = $1`, id)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM users WHERE id = $1`, id)
 	})
 	return id
@@ -92,6 +92,28 @@ func botVerificationTestVerifier(t *testing.T, s *BotVerificationStore, botID, i
 		t.Fatalf("grant verifier %d: %v", botID, err)
 	}
 	return settings
+}
+
+// botVerificationTestOrg grants verifier status under an explicit display
+// priority, for tests that must pin the projection winner rather than rely on
+// grant-time tie-breaks.
+func botVerificationTestOrg(t *testing.T, s *BotVerificationStore, botID, iconDocumentID int64, priority int) domain.VerifierOrganization {
+	t.Helper()
+	stored, err := s.UpsertVerifierOrganization(context.Background(), domain.VerifierOrganization{
+		VerifierBotID:              botID,
+		IconDocumentID:             iconDocumentID,
+		CompanyName:                fmt.Sprintf("Org %d", botID),
+		DefaultDescription:         "verified by org " + strconv.FormatInt(botID, 10),
+		CanModifyCustomDescription: true,
+		Enabled:                    true,
+		DisplayPriority:            priority,
+		GrantedBy:                  "operator",
+		GrantReason:                "test org fixture",
+	})
+	if err != nil {
+		t.Fatalf("grant verifier organization %d p%d: %v", botID, priority, err)
+	}
+	return stored
 }
 
 func botVerificationTestRequest(verifier, applicant int64, peer domain.Peer, username string) domain.CustomVerificationRequest {
@@ -410,9 +432,12 @@ func TestBotVerifierSettingsLifecyclePostgres(t *testing.T) {
 	}
 }
 
-// TestCustomVerificationProjectionPostgres is the projection contract: exactly
-// one mark exists per peer, a later verifier replaces the former one, a disabled
-// verifier projects nothing while its row survives, and the batch form resolves
+// TestCustomVerificationProjectionPostgres is the projection contract for the
+// multi-organization model: every organization's mark on a peer persists (two
+// verifiers can mark the same peer and keep their own rows), the peer is rendered
+// with exactly one winner -- the enabled organization with the lowest
+// display_priority, then most recently granted, then newest row -- the kill
+// switch hides a bot's marks without deleting them, and the batch form resolves
 // every peer in a single query.
 func TestCustomVerificationProjectionPostgres(t *testing.T) {
 	pool := testPool(t)
@@ -423,7 +448,7 @@ func TestCustomVerificationProjectionPostgres(t *testing.T) {
 	target := botVerificationTestUser(t, pool)
 	icon := botVerificationTestIcon(t, pool, s, "projection icon", 0)
 	alpha := botVerificationTestVerifier(t, s, alphaBot, icon.DocumentID)
-	beta := botVerificationTestVerifier(t, s, betaBot, icon.DocumentID+1)
+	beta := botVerificationTestOrg(t, s, betaBot, icon.DocumentID+1, 200)
 	peer := botVerificationUserPeer(target)
 
 	if _, _, err := s.GrantCustomVerification(ctx, domain.CustomVerification{
@@ -449,74 +474,81 @@ func TestCustomVerificationProjectionPostgres(t *testing.T) {
 		t.Fatalf("grant alpha mark: created=%v err=%v", created, err)
 	}
 	if alphaMark.IconDocumentID != alpha.IconDocumentID || alphaMark.Version != 1 ||
-		alphaMark.Peer != peer {
+		alphaMark.OrganizationID == 0 || alphaMark.Peer != peer {
 		t.Fatalf("alpha mark = %+v", alphaMark)
 	}
+
+	// A second verifier marking the same peer coexists with the first: both rows
+	// are stored, and each bot's bookkeeping read keeps answering with its own.
 	betaMark, created, err := s.GrantCustomVerification(ctx, domain.CustomVerification{
-		VerifierBotID: beta.BotID, Peer: peer, Description: "checked by beta",
+		VerifierBotID: beta.VerifierBotID, Peer: peer, Description: "checked by beta",
 	})
 	if err != nil || !created {
 		t.Fatalf("grant beta mark: created=%v err=%v", created, err)
 	}
-	if betaMark.ID != alphaMark.ID || betaMark.Version != alphaMark.Version+1 {
-		t.Fatalf("replacement mark = %+v, want id %d v%d", betaMark, alphaMark.ID, alphaMark.Version+1)
+	if betaMark.ID == alphaMark.ID || betaMark.Version != 1 {
+		t.Fatalf("beta coexisting mark = %+v, alpha id %d", betaMark, alphaMark.ID)
 	}
-	if _, err := s.CustomVerification(ctx, alpha.BotID, peer); !errors.Is(err, domain.ErrCustomVerificationNotFound) {
-		t.Fatalf("replaced alpha mark err = %v, want ErrCustomVerificationNotFound", err)
+	if stored, err := s.CustomVerification(ctx, alpha.BotID, peer); err != nil || stored.ID != alphaMark.ID {
+		t.Fatalf("alpha mark after beta grant = %+v err=%v", stored, err)
+	}
+	if stored, err := s.CustomVerification(ctx, beta.VerifierBotID, peer); err != nil || stored.ID != betaMark.ID {
+		t.Fatalf("beta mark after coexistence = %+v err=%v", stored, err)
+	}
+	if count, err := s.CountCustomVerifications(ctx, alpha.BotID); err != nil || count != 1 {
+		t.Fatalf("alpha mark count after coexistence = %d err=%v", count, err)
 	}
 
-	// One peer has one wire-visible mark, irrespective of how often it is read.
+	// One peer has one wire-visible mark: alpha (priority 100) beats beta (200),
+	// irrespective of grant order or row id.
 	for i := 0; i < 3; i++ {
 		got, err := s.PeerVerification(ctx, peer)
 		if err != nil {
-			t.Fatalf("projection after replacement: %v", err)
+			t.Fatalf("projection with both enabled: %v", err)
 		}
-		if got.ID != betaMark.ID || got.Projection().Icon != beta.IconDocumentID {
-			t.Fatalf("projection = %+v, want replacement mark %d", got, betaMark.ID)
+		if got.ID != alphaMark.ID || got.Projection().Icon != alpha.IconDocumentID {
+			t.Fatalf("projection = %+v, want alpha mark %d", got, alphaMark.ID)
 		}
 	}
 
-	// Kill switch: disabling the current verifier hides the badge. The replaced
-	// alpha mark must not silently reappear.
-	if _, err := s.SetBotVerifierEnabled(ctx, beta.BotID, false); err != nil {
-		t.Fatalf("disable beta: %v", err)
-	}
-	if _, err := s.PeerVerification(ctx, peer); !errors.Is(err, domain.ErrCustomVerificationNotFound) {
-		t.Fatalf("projection after disabling beta err=%v, want ErrCustomVerificationNotFound", err)
-	}
-	if stored, err := s.CustomVerification(ctx, beta.BotID, peer); err != nil || stored.ID != betaMark.ID {
-		t.Fatalf("disabled verifier lost its mark: %+v err=%v", stored, err)
-	}
-	if batch, err := s.PeerVerificationBatch(ctx, []domain.Peer{peer}); err != nil || len(batch) != 0 {
-		t.Fatalf("batch with current verifier disabled = %+v err=%v", batch, err)
-	}
-	if _, err := s.SetBotVerifierEnabled(ctx, beta.BotID, true); err != nil {
-		t.Fatalf("re-enable beta: %v", err)
+	// Kill switch: disabling the winning verifier exposes the runner-up. The mark
+	// rows survive -- only the projection stops rendering them.
+	if _, err := s.SetBotVerifierEnabled(ctx, alpha.BotID, false); err != nil {
+		t.Fatalf("disable alpha: %v", err)
 	}
 	if got, err := s.PeerVerification(ctx, peer); err != nil || got.ID != betaMark.ID {
-		t.Fatalf("projection after re-enabling = %+v err=%v", got, err)
+		t.Fatalf("projection after disabling alpha = %+v err=%v, want beta %d", got, err, betaMark.ID)
+	}
+	if stored, err := s.CustomVerification(ctx, alpha.BotID, peer); err != nil || stored.ID != alphaMark.ID {
+		t.Fatalf("disabled verifier lost its mark: %+v err=%v", stored, err)
+	}
+	if batch, err := s.PeerVerificationBatch(ctx, []domain.Peer{peer}); err != nil || len(batch) != 1 ||
+		batch[peer].ID != betaMark.ID {
+		t.Fatalf("batch with alpha disabled = %+v err=%v", batch, err)
+	}
+	if _, err := s.SetBotVerifierEnabled(ctx, alpha.BotID, true); err != nil {
+		t.Fatalf("re-enable alpha: %v", err)
+	}
+	if got, err := s.PeerVerification(ctx, peer); err != nil || got.ID != alphaMark.ID {
+		t.Fatalf("projection after re-enabling alpha = %+v err=%v", got, err)
 	}
 
-	// Granting through alpha replaces beta's mark on the same peer.
+	// Re-describing an existing mark edits the same row in place and never changes
+	// its granted_at, so alpha stays the winner regardless of the newer description.
 	regranted, created, err := s.GrantCustomVerification(ctx, domain.CustomVerification{
 		VerifierBotID: alpha.BotID, Peer: peer, IconDocumentID: icon.DocumentID + 99,
 		Description: "checked by alpha, again",
 	})
-	if err != nil || !created {
+	if err != nil || created {
 		t.Fatalf("re-grant alpha mark: created=%v err=%v", created, err)
 	}
-	if regranted.ID != betaMark.ID || regranted.Version != betaMark.Version+1 ||
+	if regranted.ID != alphaMark.ID || regranted.Version != alphaMark.Version+1 ||
 		regranted.IconDocumentID != icon.DocumentID+99 ||
-		regranted.Description != "checked by alpha, again" {
+		regranted.Description != "checked by alpha, again" ||
+		!regranted.GrantedAt.Equal(alphaMark.GrantedAt) {
 		t.Fatalf("re-granted mark = %+v", regranted)
 	}
-	if regranted.CreatedAt.Before(betaMark.CreatedAt) || !regranted.UpdatedAt.After(betaMark.UpdatedAt) {
-		t.Fatalf("re-granted timestamps = %v / %v", regranted.CreatedAt, regranted.UpdatedAt)
-	}
-	if count, err := s.CountCustomVerifications(ctx, alpha.BotID); err != nil || count != 1 {
-		t.Fatalf("alpha mark count = %d err=%v", count, err)
-	}
-	if got, err := s.PeerVerification(ctx, peer); err != nil || got.VerifierBotID != alpha.BotID {
+	if got, err := s.PeerVerification(ctx, peer); err != nil || got.ID != regranted.ID {
 		t.Fatalf("projection after re-grant = %+v err=%v", got, err)
 	}
 
@@ -532,13 +564,13 @@ func TestCustomVerificationProjectionPostgres(t *testing.T) {
 		t.Fatalf("grant second: %v", err)
 	}
 	thirdMark, _, err := s.GrantCustomVerification(ctx, domain.CustomVerification{
-		VerifierBotID: beta.BotID, Peer: third, Description: "third",
+		VerifierBotID: beta.VerifierBotID, Peer: third, Description: "third",
 	})
 	if err != nil {
 		t.Fatalf("grant third: %v", err)
 	}
 	fourthMark, _, err := s.GrantCustomVerification(ctx, domain.CustomVerification{
-		VerifierBotID: beta.BotID, Peer: fourth, Description: "fourth",
+		VerifierBotID: beta.VerifierBotID, Peer: fourth, Description: "fourth",
 	})
 	if err != nil {
 		t.Fatalf("grant fourth: %v", err)
@@ -572,7 +604,7 @@ func TestCustomVerificationProjectionPostgres(t *testing.T) {
 	}
 
 	// Disabling a verifier drops its peers from the batch too, in the same query.
-	if _, err := s.SetBotVerifierEnabled(ctx, beta.BotID, false); err != nil {
+	if _, err := s.SetBotVerifierEnabled(ctx, beta.VerifierBotID, false); err != nil {
 		t.Fatalf("disable beta again: %v", err)
 	}
 	batch, err = s.PeerVerificationBatch(ctx, []domain.Peer{peer, second, third, fourth})
@@ -582,39 +614,40 @@ func TestCustomVerificationProjectionPostgres(t *testing.T) {
 	if len(batch) != 2 || batch[peer].ID != regranted.ID || batch[second].ID != secondMark.ID {
 		t.Fatalf("batch after disable = %+v", batch)
 	}
-	if _, err := s.SetBotVerifierEnabled(ctx, beta.BotID, true); err != nil {
+	if _, err := s.SetBotVerifierEnabled(ctx, beta.VerifierBotID, true); err != nil {
 		t.Fatalf("re-enable beta again: %v", err)
 	}
 
 	// Listing, filtering and keyset paging over the marks.
 	mine, err := s.ListCustomVerifications(ctx, domain.CustomVerificationFilter{
-		VerifierBotID: beta.BotID,
+		VerifierBotID: beta.VerifierBotID,
 	})
-	if err != nil || len(mine) != 2 || mine[0].ID != fourthMark.ID {
+	if err != nil || len(mine) != 3 || mine[0].ID != fourthMark.ID {
 		t.Fatalf("verifier-filtered marks = %+v err=%v", mine, err)
 	}
 	page, err := s.ListCustomVerifications(ctx, domain.CustomVerificationFilter{
-		VerifierBotID: beta.BotID, Limit: 2,
+		VerifierBotID: beta.VerifierBotID, Limit: 2,
 	})
 	if err != nil || len(page) != 2 {
 		t.Fatalf("mark page = %+v err=%v", page, err)
 	}
 	next, err := s.ListCustomVerifications(ctx, domain.CustomVerificationFilter{
-		VerifierBotID: beta.BotID, Limit: 2, BeforeID: page[len(page)-1].ID,
+		VerifierBotID: beta.VerifierBotID, Limit: 2, BeforeID: page[len(page)-1].ID,
 	})
-	if err != nil || len(next) != 0 {
+	if err != nil || len(next) != 1 || next[0].ID != betaMark.ID {
 		t.Fatalf("mark keyset tail = %+v err=%v", next, err)
 	}
 	channels, err := s.ListCustomVerifications(ctx, domain.CustomVerificationFilter{
-		VerifierBotID: beta.BotID, PeerType: domain.PeerTypeChannel,
+		VerifierBotID: beta.VerifierBotID, PeerType: domain.PeerTypeChannel,
 	})
 	if err != nil || len(channels) != 1 || channels[0].Peer != fourth {
 		t.Fatalf("channel-filtered marks = %+v err=%v", channels, err)
 	}
+	// The peer filter spans every organization: both verifiers' marks coexist.
 	byPeer, err := s.ListCustomVerifications(ctx, domain.CustomVerificationFilter{
 		PeerType: peer.Type, PeerID: peer.ID,
 	})
-	if err != nil || len(byPeer) != 1 {
+	if err != nil || len(byPeer) != 2 {
 		t.Fatalf("peer-filtered marks = %+v err=%v", byPeer, err)
 	}
 	byQuery, err := s.ListCustomVerifications(ctx, domain.CustomVerificationFilter{
@@ -635,19 +668,23 @@ func TestCustomVerificationProjectionPostgres(t *testing.T) {
 		t.Fatalf("bad peer-type filter err = %v, want ErrCustomVerificationTargetInvalid", err)
 	}
 
-	// A replaced verifier cannot revoke the current mark.
-	revoked, err := s.RevokeCustomVerification(ctx, beta.BotID, peer)
-	if err != nil || revoked {
-		t.Fatalf("revoke replaced beta mark: revoked=%v err=%v", revoked, err)
+	// A verifier revokes its own winning mark, which exposes another verifier's
+	// coexisting mark rather than leaving the peer unmarked.
+	revoked, err := s.RevokeCustomVerification(ctx, beta.VerifierBotID, peer)
+	if err != nil || !revoked {
+		t.Fatalf("revoke beta mark: revoked=%v err=%v", revoked, err)
 	}
-	if revoked, err := s.RevokeCustomVerification(ctx, beta.BotID, peer); err != nil || revoked {
+	if revoked, err := s.RevokeCustomVerification(ctx, beta.VerifierBotID, peer); err != nil || revoked {
 		t.Fatalf("repeated revoke: revoked=%v err=%v", revoked, err)
 	}
 	if got, err := s.PeerVerification(ctx, peer); err != nil || got.ID != regranted.ID {
-		t.Fatalf("projection after rejected revoke = %+v err=%v", got, err)
+		t.Fatalf("projection after beta revoke = %+v err=%v", got, err)
 	}
 	if revoked, err := s.RevokeCustomVerification(ctx, alpha.BotID, peer); err != nil || !revoked {
 		t.Fatalf("revoke alpha mark: revoked=%v err=%v", revoked, err)
+	}
+	if _, err := s.PeerVerification(ctx, peer); !errors.Is(err, domain.ErrCustomVerificationNotFound) {
+		t.Fatalf("projection after both revoked err = %v, want ErrCustomVerificationNotFound", err)
 	}
 	if _, err := s.RevokeCustomVerification(ctx, 0, peer); !errors.Is(err, domain.ErrCustomVerificationTargetInvalid) {
 		t.Fatalf("revoke without verifier err = %v, want ErrCustomVerificationTargetInvalid", err)
@@ -669,10 +706,11 @@ func TestCustomVerificationLimitPostgres(t *testing.T) {
 	// key, which is what makes that safe.
 	if _, err := pool.Exec(ctx, `
 INSERT INTO custom_verifications (
-  verifier_bot_id, peer_type, peer_id, icon_document_id, description,
-  created_at, updated_at, version
+  verifier_bot_id, organization_id, peer_type, peer_id, icon_document_id,
+  description, granted_at, created_at, updated_at, version
 )
-SELECT $1, 'channel', g, $2, '', $3, $3, 1
+SELECT $1, (SELECT id FROM verifier_organizations WHERE verifier_bot_id = $1 LIMIT 1),
+  'channel', g, $2, '', $3, $3, $3, 1
 FROM generate_series(1, $4::bigint) AS g`,
 		verifier.BotID, verifier.IconDocumentID, time.Now().UTC(),
 		domain.MaxCustomVerificationsPerVerifier); err != nil {

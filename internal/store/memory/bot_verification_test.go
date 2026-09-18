@@ -37,6 +37,28 @@ func botVerificationTestVerifier(t *testing.T, s *BotVerificationStore, botID, i
 	return settings
 }
 
+// botVerificationTestOrg grants verifier status under an explicit display
+// priority, for tests that must pin the projection winner rather than rely on
+// grant-time tie-breaks.
+func botVerificationTestOrg(t *testing.T, s *BotVerificationStore, botID, iconDocumentID int64, priority int) domain.VerifierOrganization {
+	t.Helper()
+	stored, err := s.UpsertVerifierOrganization(context.Background(), domain.VerifierOrganization{
+		VerifierBotID:              botID,
+		IconDocumentID:             iconDocumentID,
+		CompanyName:                fmt.Sprintf("Org %d", botID),
+		DefaultDescription:         "verified by org",
+		CanModifyCustomDescription: true,
+		Enabled:                    true,
+		DisplayPriority:            priority,
+		GrantedBy:                  "operator",
+		GrantReason:                "test org fixture",
+	})
+	if err != nil {
+		t.Fatalf("grant verifier organization %d p%d: %v", botID, priority, err)
+	}
+	return stored
+}
+
 // botVerificationTestRequest is an application that clears domain validation.
 func botVerificationTestRequest(verifier, applicant int64, peer domain.Peer, username string) domain.CustomVerificationRequest {
 	return domain.CustomVerificationRequest{
@@ -284,15 +306,17 @@ func TestBotVerifierSettingsLifecycleMemory(t *testing.T) {
 	}
 }
 
-// TestCustomVerificationGrantAndProjectionMemory is the projection contract:
-// exactly one mark exists per peer, a later verifier replaces the former one,
-// a disabled verifier projects nothing while its row survives, and a repeated
-// grant updates the mark in place.
+// TestCustomVerificationGrantAndProjectionMemory is the projection contract for
+// the multi-organization model: every organization's mark on a peer persists
+// (two verifiers can mark the same peer and keep their own rows), the peer is
+// rendered with exactly one winner -- the enabled organization with the lowest
+// display_priority, then most recently granted -- and a repeated grant updates
+// the same row in place.
 func TestCustomVerificationGrantAndProjectionMemory(t *testing.T) {
 	ctx := context.Background()
 	s := NewBotVerificationStore()
 	alpha := botVerificationTestVerifier(t, s, 101, 5001)
-	beta := botVerificationTestVerifier(t, s, 102, 5002)
+	beta := botVerificationTestOrg(t, s, 102, 5002, 200)
 	peer := botVerificationUserPeer(7001)
 
 	if _, _, err := s.GrantCustomVerification(ctx, domain.CustomVerification{
@@ -314,7 +338,8 @@ func TestCustomVerificationGrantAndProjectionMemory(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("grant alpha mark: created=%v err=%v", created, err)
 	}
-	if alphaMark.IconDocumentID != alpha.IconDocumentID || alphaMark.Version != 1 {
+	if alphaMark.IconDocumentID != alpha.IconDocumentID || alphaMark.Version != 1 ||
+		alphaMark.OrganizationID == 0 || alphaMark.GrantedAt.IsZero() {
 		t.Fatalf("alpha mark = %+v", alphaMark)
 	}
 	if alphaMark.CreatedAt.IsZero() || !alphaMark.UpdatedAt.Equal(alphaMark.CreatedAt) {
@@ -325,75 +350,88 @@ func TestCustomVerificationGrantAndProjectionMemory(t *testing.T) {
 		t.Fatalf("projection with one mark = %+v err=%v", got, err)
 	}
 
+	// A second verifier marking the same peer coexists with the first: both rows
+	// are stored, and each bot's bookkeeping read keeps answering with its own.
 	betaMark, created, err := s.GrantCustomVerification(ctx, domain.CustomVerification{
-		VerifierBotID: beta.BotID, Peer: peer, Description: "checked by beta",
+		VerifierBotID: beta.VerifierBotID, Peer: peer, Description: "checked by beta",
 	})
 	if err != nil || !created {
 		t.Fatalf("grant beta mark: created=%v err=%v", created, err)
 	}
+	if betaMark.ID == alphaMark.ID || betaMark.Version != 1 {
+		t.Fatalf("beta coexisting mark = %+v, alpha id %d", betaMark, alphaMark.ID)
+	}
+	if stored, err := s.CustomVerification(ctx, alpha.BotID, peer); err != nil || stored.ID != alphaMark.ID {
+		t.Fatalf("alpha mark after beta grant = %+v err=%v", stored, err)
+	}
+	if stored, err := s.CustomVerification(ctx, beta.VerifierBotID, peer); err != nil || stored.ID != betaMark.ID {
+		t.Fatalf("beta mark after coexistence = %+v err=%v", stored, err)
+	}
+	if count, err := s.CountCustomVerifications(ctx, alpha.BotID); err != nil || count != 1 {
+		t.Fatalf("alpha mark count after coexistence = %d err=%v", count, err)
+	}
 
-	if betaMark.ID != alphaMark.ID || betaMark.Version != alphaMark.Version+1 {
-		t.Fatalf("replacement mark = %+v, want id %d v%d", betaMark, alphaMark.ID, alphaMark.Version+1)
-	}
-	if _, err := s.CustomVerification(ctx, alpha.BotID, peer); !errors.Is(err, domain.ErrCustomVerificationNotFound) {
-		t.Fatalf("replaced alpha mark err = %v, want ErrCustomVerificationNotFound", err)
-	}
-	if count, err := s.CountCustomVerifications(ctx, alpha.BotID); err != nil || count != 0 {
-		t.Fatalf("alpha mark count after replacement = %d err=%v", count, err)
-	}
-
-	// One peer has one wire-visible mark, irrespective of how often it is read.
+	// One peer has one wire-visible mark: alpha (priority 100) beats beta (200),
+	// irrespective of grant order or row id.
 	for i := 0; i < 3; i++ {
 		got, err := s.PeerVerification(ctx, peer)
 		if err != nil {
-			t.Fatalf("projection after replacement: %v", err)
+			t.Fatalf("projection with both enabled: %v", err)
 		}
-		if got.ID != betaMark.ID || got.VerifierBotID != beta.BotID {
-			t.Fatalf("projection = %+v, want replacement mark %d", got, betaMark.ID)
+		if got.ID != alphaMark.ID || got.VerifierBotID != alpha.BotID {
+			t.Fatalf("projection = %+v, want alpha mark %d", got, alphaMark.ID)
 		}
-		if got.Projection().Icon != beta.IconDocumentID {
-			t.Fatalf("projected icon = %d, want %d", got.Projection().Icon, beta.IconDocumentID)
+		if got.Projection().Icon != alpha.IconDocumentID {
+			t.Fatalf("projected icon = %d, want %d", got.Projection().Icon, alpha.IconDocumentID)
 		}
 	}
 
-	// Kill switch: disabling the current verifier hides the badge. The replaced
-	// alpha mark must not silently reappear.
-	if _, err := s.SetBotVerifierEnabled(ctx, beta.BotID, false); err != nil {
+	// Kill switch: disabling the winning verifier exposes the runner-up. The mark
+	// rows survive -- only the projection stops rendering them.
+	if _, err := s.SetBotVerifierEnabled(ctx, beta.VerifierBotID, false); err != nil {
 		t.Fatalf("disable beta: %v", err)
 	}
-	if _, err := s.PeerVerification(ctx, peer); !errors.Is(err, domain.ErrCustomVerificationNotFound) {
-		t.Fatalf("projection after disabling beta err=%v, want ErrCustomVerificationNotFound", err)
+	if got, err := s.PeerVerification(ctx, peer); err != nil || got.ID != alphaMark.ID {
+		t.Fatalf("projection after disabling beta = %+v err=%v, want alpha %d", got, err, alphaMark.ID)
 	}
-	if stored, err := s.CustomVerification(ctx, beta.BotID, peer); err != nil || stored.ID != betaMark.ID {
+	if stored, err := s.CustomVerification(ctx, beta.VerifierBotID, peer); err != nil || stored.ID != betaMark.ID {
 		t.Fatalf("disabled verifier lost its mark: %+v err=%v", stored, err)
 	}
-	if _, err := s.SetBotVerifierEnabled(ctx, beta.BotID, true); err != nil {
+	if _, err := s.SetBotVerifierEnabled(ctx, beta.VerifierBotID, true); err != nil {
 		t.Fatalf("re-enable beta: %v", err)
 	}
-	if got, err := s.PeerVerification(ctx, peer); err != nil || got.ID != betaMark.ID {
-		t.Fatalf("projection after re-enabling beta = %+v err=%v", got, err)
+	if _, err := s.SetBotVerifierEnabled(ctx, alpha.BotID, false); err != nil {
+		t.Fatalf("disable alpha: %v", err)
 	}
-	// Granting through alpha replaces beta's mark on the same peer.
+	if got, err := s.PeerVerification(ctx, peer); err != nil || got.ID != betaMark.ID {
+		t.Fatalf("projection after disabling alpha = %+v err=%v, want beta %d", got, err, betaMark.ID)
+	}
+	if _, err := s.SetBotVerifierEnabled(ctx, alpha.BotID, true); err != nil {
+		t.Fatalf("re-enable alpha: %v", err)
+	}
+	if got, err := s.PeerVerification(ctx, peer); err != nil || got.ID != alphaMark.ID {
+		t.Fatalf("projection after re-enabling alpha = %+v err=%v", got, err)
+	}
+
+	// Re-describing an existing mark edits the same row in place and never changes
+	// its granted_at, so alpha stays the winner regardless of the newer description.
 	regranted, created, err := s.GrantCustomVerification(ctx, domain.CustomVerification{
 		VerifierBotID: alpha.BotID, Peer: peer, IconDocumentID: 5099,
 		Description: "checked by alpha, again",
 	})
-	if err != nil || !created {
+	if err != nil || created {
 		t.Fatalf("re-grant alpha mark: created=%v err=%v", created, err)
 	}
-	if regranted.ID != betaMark.ID || regranted.Version != betaMark.Version+1 {
-		t.Fatalf("re-granted mark = %+v, want id %d v%d", regranted, betaMark.ID, betaMark.Version+1)
+	if regranted.ID != alphaMark.ID || regranted.Version != alphaMark.Version+1 {
+		t.Fatalf("re-granted mark = %+v, want id %d v%d", regranted, alphaMark.ID, alphaMark.Version+1)
 	}
 	if regranted.IconDocumentID != 5099 || regranted.Description != "checked by alpha, again" {
 		t.Fatalf("re-granted payload = %+v", regranted)
 	}
-	if regranted.CreatedAt.Before(betaMark.CreatedAt) || !regranted.UpdatedAt.After(betaMark.UpdatedAt) {
-		t.Fatalf("re-granted timestamps = %v / %v", regranted.CreatedAt, regranted.UpdatedAt)
+	if !regranted.GrantedAt.Equal(alphaMark.GrantedAt) {
+		t.Fatalf("re-grant moved granted_at: %v -> %v", alphaMark.GrantedAt, regranted.GrantedAt)
 	}
-	if count, err := s.CountCustomVerifications(ctx, alpha.BotID); err != nil || count != 1 {
-		t.Fatalf("alpha mark count = %d err=%v", count, err)
-	}
-	if got, err := s.PeerVerification(ctx, peer); err != nil || got.VerifierBotID != alpha.BotID {
+	if got, err := s.PeerVerification(ctx, peer); err != nil || got.ID != regranted.ID {
 		t.Fatalf("projection after re-grant = %+v err=%v", got, err)
 	}
 
@@ -408,7 +446,7 @@ func TestCustomVerificationGrantAndProjectionMemory(t *testing.T) {
 		t.Fatalf("grant second: %v", err)
 	}
 	thirdMark, _, err := s.GrantCustomVerification(ctx, domain.CustomVerification{
-		VerifierBotID: beta.BotID, Peer: third, Description: "third",
+		VerifierBotID: beta.VerifierBotID, Peer: third, Description: "third",
 	})
 	if err != nil {
 		t.Fatalf("grant third: %v", err)
@@ -433,7 +471,7 @@ func TestCustomVerificationGrantAndProjectionMemory(t *testing.T) {
 	}
 
 	// Disabling a verifier drops its peers from the batch too.
-	if _, err := s.SetBotVerifierEnabled(ctx, beta.BotID, false); err != nil {
+	if _, err := s.SetBotVerifierEnabled(ctx, beta.VerifierBotID, false); err != nil {
 		t.Fatalf("disable beta again: %v", err)
 	}
 	batch, err = s.PeerVerificationBatch(ctx, []domain.Peer{peer, second, third})
@@ -446,13 +484,13 @@ func TestCustomVerificationGrantAndProjectionMemory(t *testing.T) {
 	if _, present := batch[third]; present {
 		t.Fatal("disabled verifier still projects in the batch")
 	}
-	if _, err := s.SetBotVerifierEnabled(ctx, beta.BotID, true); err != nil {
+	if _, err := s.SetBotVerifierEnabled(ctx, beta.VerifierBotID, true); err != nil {
 		t.Fatalf("re-enable beta again: %v", err)
 	}
 
 	// Listing and paging over the marks.
 	all, err := s.ListCustomVerifications(ctx, domain.CustomVerificationFilter{})
-	if err != nil || len(all) != 3 {
+	if err != nil || len(all) != 4 {
 		t.Fatalf("list marks = %+v err=%v", all, err)
 	}
 	if all[0].ID != thirdMark.ID {
@@ -465,7 +503,7 @@ func TestCustomVerificationGrantAndProjectionMemory(t *testing.T) {
 	next, err := s.ListCustomVerifications(ctx, domain.CustomVerificationFilter{
 		Limit: 2, BeforeID: page[len(page)-1].ID,
 	})
-	if err != nil || len(next) != 1 || next[0].ID >= page[len(page)-1].ID {
+	if err != nil || len(next) != 2 || next[0].ID >= page[len(page)-1].ID {
 		t.Fatalf("mark keyset page = %+v err=%v", next, err)
 	}
 	mine, err := s.ListCustomVerifications(ctx, domain.CustomVerificationFilter{
@@ -480,10 +518,11 @@ func TestCustomVerificationGrantAndProjectionMemory(t *testing.T) {
 	if err != nil || len(channels) != 1 || channels[0].Peer != second {
 		t.Fatalf("channel-filtered marks = %+v err=%v", channels, err)
 	}
+	// The peer filter spans every organization: both verifiers' marks coexist.
 	byPeer, err := s.ListCustomVerifications(ctx, domain.CustomVerificationFilter{
 		PeerType: peer.Type, PeerID: peer.ID,
 	})
-	if err != nil || len(byPeer) != 1 {
+	if err != nil || len(byPeer) != 2 {
 		t.Fatalf("peer-filtered marks = %+v err=%v", byPeer, err)
 	}
 	byQuery, err := s.ListCustomVerifications(ctx, domain.CustomVerificationFilter{
@@ -502,19 +541,23 @@ func TestCustomVerificationGrantAndProjectionMemory(t *testing.T) {
 		t.Fatalf("bad peer-type filter err = %v, want ErrCustomVerificationTargetInvalid", err)
 	}
 
-	// A replaced verifier cannot revoke the current mark.
-	revoked, err := s.RevokeCustomVerification(ctx, beta.BotID, peer)
-	if err != nil || revoked {
-		t.Fatalf("revoke replaced beta mark: revoked=%v err=%v", revoked, err)
+	// A verifier revokes its own winning mark, which exposes another verifier's
+	// coexisting mark rather than leaving the peer unmarked.
+	revoked, err := s.RevokeCustomVerification(ctx, beta.VerifierBotID, peer)
+	if err != nil || !revoked {
+		t.Fatalf("revoke beta mark: revoked=%v err=%v", revoked, err)
 	}
-	if revoked, err := s.RevokeCustomVerification(ctx, beta.BotID, peer); err != nil || revoked {
+	if revoked, err := s.RevokeCustomVerification(ctx, beta.VerifierBotID, peer); err != nil || revoked {
 		t.Fatalf("repeated revoke: revoked=%v err=%v", revoked, err)
 	}
 	if got, err := s.PeerVerification(ctx, peer); err != nil || got.ID != regranted.ID {
-		t.Fatalf("projection after rejected revoke = %+v err=%v", got, err)
+		t.Fatalf("projection after beta revoke = %+v err=%v", got, err)
 	}
 	if revoked, err := s.RevokeCustomVerification(ctx, alpha.BotID, peer); err != nil || !revoked {
 		t.Fatalf("revoke alpha mark: revoked=%v err=%v", revoked, err)
+	}
+	if _, err := s.PeerVerification(ctx, peer); !errors.Is(err, domain.ErrCustomVerificationNotFound) {
+		t.Fatalf("projection after both revoked err = %v, want ErrCustomVerificationNotFound", err)
 	}
 	if _, err := s.RevokeCustomVerification(ctx, 0, peer); !errors.Is(err, domain.ErrCustomVerificationTargetInvalid) {
 		t.Fatalf("revoke without verifier err = %v, want ErrCustomVerificationTargetInvalid", err)

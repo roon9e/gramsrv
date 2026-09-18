@@ -96,11 +96,11 @@ VALUES ($1, $2, $3, $4, $5, $5) RETURNING id`,
 
 	insertVerifier := func(botID, documentID int64, company string, enabled, canModify bool) {
 		if _, err := pool.Exec(ctx, `
-INSERT INTO bot_verifier_settings (
-	bot_id, icon_document_id, company_name, default_description,
-	can_modify_custom_description, enabled, granted_by, grant_reason,
+INSERT INTO verifier_organizations (
+	verifier_bot_id, icon_document_id, company_name, default_description,
+	can_modify_custom_description, enabled, display_priority, granted_by, grant_reason,
 	created_at, updated_at, version
-) VALUES ($1, $2, $3, 'verified by the fixture', $4, $5, 'alice', 'partner programme', $6, $6, 4)`,
+) VALUES ($1, $2, $3, 'verified by the fixture', $4, $5, 100, 'alice', 'partner programme', $6, $6, 4)`,
 			botID, documentID, company, canModify, enabled, now); err != nil {
 			t.Fatalf("insert verifier %d: %v", botID, err)
 		}
@@ -112,9 +112,10 @@ INSERT INTO bot_verifier_settings (
 		var id int64
 		if err := pool.QueryRow(ctx, `
 INSERT INTO custom_verifications (
-	verifier_bot_id, peer_type, peer_id, icon_document_id, description,
-	granted_by_user_id, created_at, updated_at, version
-) VALUES ($1, $2, $3, $4, $5, $1, $6, $6, 2) RETURNING id`,
+	verifier_bot_id, organization_id, peer_type, peer_id, icon_document_id, description,
+	granted_by_user_id, granted_at, created_at, updated_at, version
+) VALUES ($1, (SELECT id FROM verifier_organizations WHERE verifier_bot_id = $1 LIMIT 1),
+	$2, $3, $4, $5, $1, $6, $6, $6, 2) RETURNING id`,
 			fx.verifierBot, peerType, peerID, fx.sharedDoc, description, now).Scan(&id); err != nil {
 			t.Fatalf("insert %s mark: %v", peerType, err)
 		}
@@ -168,7 +169,7 @@ INSERT INTO custom_verification_requests (
 		_, _ = pool.Exec(ctx, "DELETE FROM custom_verification_requests WHERE id = ANY($1::bigint[])", reqIDs)
 		_, _ = pool.Exec(ctx, "DELETE FROM custom_verifications WHERE id = ANY($1::bigint[])",
 			[]int64{fx.userMark, fx.channelMark})
-		_, _ = pool.Exec(ctx, "DELETE FROM bot_verifier_settings WHERE bot_id = ANY($1::bigint[])",
+		_, _ = pool.Exec(ctx, "DELETE FROM verifier_organizations WHERE verifier_bot_id = ANY($1::bigint[])",
 			[]int64{fx.verifierBot, fx.disabledBot})
 		_, _ = pool.Exec(ctx, "DELETE FROM verification_icons WHERE id = ANY($1::bigint[])",
 			[]int64{fx.sharedIcon, fx.reservedIcon})

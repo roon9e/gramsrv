@@ -56,6 +56,12 @@ const (
 	// mark. Verifier status is granted per deployment, not earned per peer, so an
 	// unbounded verifier would be an unbounded badge printer.
 	MaxCustomVerificationsPerVerifier = 10000
+	// DefaultVerifierDisplayPriority is the display_priority a new organization
+	// receives when the operator does not rank it. Lower priority wins the single
+	// wire slot, so the default keeps first come first positioned.
+	DefaultVerifierDisplayPriority = 100
+	// MaxVerifierDisplayPriority bounds an operator-supplied rank.
+	MaxVerifierDisplayPriority = 10000
 )
 
 var (
@@ -66,6 +72,8 @@ var (
 	ErrVerifierForbidden = errors.New("bot is not allowed to verify peers")
 	// ErrVerifierSettingsInvalid rejects a malformed verifier configuration.
 	ErrVerifierSettingsInvalid = errors.New("bot verifier settings invalid")
+	// ErrOrganizationNotFound reports an organization id that names no row.
+	ErrOrganizationNotFound = errors.New("verifier organization not found")
 	// ErrVerifierDescriptionForbidden reports a per-peer description supplied by a
 	// verifier whose can_modify_custom_description is false.
 	ErrVerifierDescriptionForbidden = errors.New("verifier may not set a custom description")
@@ -169,14 +177,21 @@ func (s BotVerifierSettings) Validate() error {
 // one when allowed, the configured default, or the protocol-defined generated
 // fallback.
 func (s BotVerifierSettings) DescriptionFor(custom string) (string, error) {
+	return verifierDescription(s.CompanyName, s.DefaultDescription, s.CanModifyCustomDescription, custom)
+}
+
+// verifierDescription is the shared description resolution for settings and for
+// an organization, so an organization-fronted verifier cannot behave differently
+// from the legacy bot-level one.
+func verifierDescription(companyName, defaultDescription string, canModify bool, custom string) (string, error) {
 	custom = strings.TrimSpace(custom)
 	if custom == "" {
-		if fallback := strings.TrimSpace(s.DefaultDescription); fallback != "" {
+		if fallback := strings.TrimSpace(defaultDescription); fallback != "" {
 			return fallback, nil
 		}
-		return fmt.Sprintf(`Was verified by organization "%s"`, strings.TrimSpace(s.CompanyName)), nil
+		return fmt.Sprintf(`Was verified by organization "%s"`, strings.TrimSpace(companyName)), nil
 	}
-	if !s.CanModifyCustomDescription {
+	if !canModify {
 		return "", ErrVerifierDescriptionForbidden
 	}
 	if utf8.RuneCountInString(custom) > MaxCustomVerificationDescriptionLength {
@@ -185,9 +200,85 @@ func (s BotVerifierSettings) DescriptionFor(custom string) (string, error) {
 	return custom, nil
 }
 
+// VerifierOrganization is one company fronted by a verifier bot. A bot is a
+// verifier iff it hosts organizations, and the wire still projects exactly one
+// botVerifierSettings block plus one visible mark per peer: the bot's PRIMARY
+// organization (lowest DisplayPriority) owns both, and the winner of a peer's
+// mark tie is resolved by the store projection.
+type VerifierOrganization struct {
+	ID                     int64
+	VerifierBotID          int64
+	CompanyName            string
+	IconDocumentID         int64
+	DefaultDescription     string
+	CanModifyCustomDescription bool
+	Enabled                bool
+	DisplayPriority        int
+	// GrantedBy and GrantReason are the operator attestation recorded when the
+	// organization was admitted to the catalogue.
+	GrantedBy   string
+	GrantReason string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	Version     int64
+}
+
+// Validate checks the organization configuration.
+func (o VerifierOrganization) Validate() error {
+	if o.VerifierBotID <= 0 || o.IconDocumentID <= 0 {
+		return ErrVerifierSettingsInvalid
+	}
+	if o.DisplayPriority <= 0 || o.DisplayPriority > MaxVerifierDisplayPriority {
+		return ErrVerifierSettingsInvalid
+	}
+	company := strings.TrimSpace(o.CompanyName)
+	if company == "" || utf8.RuneCountInString(company) > MaxVerifierCompanyLength {
+		return ErrVerifierSettingsInvalid
+	}
+	if utf8.RuneCountInString(o.DefaultDescription) > MaxCustomVerificationDescriptionLength {
+		return ErrVerifierSettingsInvalid
+	}
+	if len(o.GrantedBy) > 128 || utf8.RuneCountInString(o.GrantReason) > MaxVerifierGrantReasonLength {
+		return ErrVerifierSettingsInvalid
+	}
+	return nil
+}
+
+// DescriptionFor resolves the description a mark granted by this organization
+// carries, identically to BotVerifierSettings.DescriptionFor.
+func (o VerifierOrganization) DescriptionFor(custom string) (string, error) {
+	return verifierDescription(o.CompanyName, o.DefaultDescription, o.CanModifyCustomDescription, custom)
+}
+
+// SettingsFor synthesizes the bot-level settings block (botVerifierSettings)
+// from this organization, which is what the primary organization does for its
+// bot.
+func (o VerifierOrganization) SettingsFor() BotVerifierSettings {
+	return BotVerifierSettings{
+		BotID:                      o.VerifierBotID,
+		IconDocumentID:             o.IconDocumentID,
+		CompanyName:                o.CompanyName,
+		DefaultDescription:         o.DefaultDescription,
+		CanModifyCustomDescription: o.CanModifyCustomDescription,
+		Enabled:                    o.Enabled,
+		GrantedBy:                  o.GrantedBy,
+		GrantReason:                o.GrantReason,
+		CreatedAt:                  o.CreatedAt,
+		UpdatedAt:                  o.UpdatedAt,
+		Version:                    o.Version,
+	}
+}
+
 // CustomVerification is one granted third-party mark.
 type CustomVerification struct {
-	ID            int64
+	ID int64
+	// OrganizationID is the verifier row this mark belongs to. A zero value
+	// means "resolve the bot's primary organization": the store always resolves
+	// it before persisting, so rows never carry zero.
+	OrganizationID int64
+	// VerifierBotID is denormalised for the wire projection: the bot the mark is
+	// shown under. An organization never moves between bots, so it cannot drift
+	// from its organization's owner.
 	VerifierBotID int64
 	Peer          Peer
 	// IconDocumentID is denormalised at grant time so the mark keeps rendering the
@@ -195,9 +286,13 @@ type CustomVerification struct {
 	IconDocumentID  int64
 	Description     string
 	GrantedByUserID int64
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	Version         int64
+	// GrantedAt is when this mark won the organization: creation for a granted
+	// mark, or the revoke/regrant time for a revived one. It feeds the winner
+	// tie-break (newest granted wins).
+	GrantedAt time.Time
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	Version   int64
 }
 
 // BotVerification is the TL projection (botVerification#f93cd45c).
@@ -278,9 +373,14 @@ func CanTransitionCustomVerificationStatus(from, to CustomVerificationRequestSta
 
 // CustomVerificationRequest is an application filed with a verifier bot.
 type CustomVerificationRequest struct {
-	ID                   int64
-	VerifierBotID        int64
-	ApplicantUserID      int64
+	ID int64
+	// OrganizationID is the organization the application was filed with. It is
+	// resolved like a mark's: zero means the bot's primary organization at
+	// filing time. The value may be zero on a historical row whose organization
+	// was deleted (the column is cleared rather than the row cascaded away).
+	OrganizationID int64
+	VerifierBotID    int64
+	ApplicantUserID  int64
 	Peer                 Peer
 	PeerTitle            string
 	PeerUsername         string
@@ -320,8 +420,12 @@ func (r CustomVerificationRequest) Validate() error {
 // SetCustomVerificationRequest is the bots.setCustomVerification payload after the
 // RPC edge has resolved the caller, the verifier bot and the target peer.
 type SetCustomVerificationRequest struct {
-	VerifierBotID int64
-	Peer          Peer
+	// OrganizationID selects the organization the verifier bot marks on behalf
+	// of once it hosts several. Zero (the current wire has no slot for it) means
+	// the bot's primary organization.
+	OrganizationID int64
+	VerifierBotID  int64
+	Peer           Peer
 	// Enabled false revokes the mark this verifier granted; the request then
 	// carries no description.
 	Enabled bool
@@ -350,20 +454,22 @@ func (r SetCustomVerificationRequest) Validate() error {
 
 // CustomVerificationFilter bounds an admin listing query.
 type CustomVerificationFilter struct {
-	VerifierBotID int64
-	PeerType      PeerType
-	PeerID        int64
-	Query         string
-	BeforeID      int64
-	Limit         int
+	VerifierBotID   int64
+	OrganizationID  int64
+	PeerType        PeerType
+	PeerID          int64
+	Query           string
+	BeforeID        int64
+	Limit           int
 }
 
 // CustomVerificationRequestFilter bounds a review-queue query.
 type CustomVerificationRequestFilter struct {
-	Statuses      []CustomVerificationRequestStatus
-	VerifierBotID int64
-	PeerType      PeerType
-	Query         string
-	BeforeID      int64
-	Limit         int
+	Statuses       []CustomVerificationRequestStatus
+	OrganizationID int64
+	VerifierBotID  int64
+	PeerType       PeerType
+	Query          string
+	BeforeID       int64
+	Limit          int
 }

@@ -16,7 +16,7 @@ import (
 // This is NOT the official platform badge (see verification.go): third-party
 // verification is an attributed mark granted by a verifier bot, carrying that
 // verifier's own custom emoji icon and description. The two mechanisms own
-// separate tables (verification_icons / bot_verifier_settings /
+// separate tables (verification_icons / verifier_organizations /
 // custom_verifications / custom_verification_requests vs
 // verification_applications), separate permissions (botverification.* vs
 // verification.*) and separate routes, and neither reads the other's state.

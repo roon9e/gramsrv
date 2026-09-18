@@ -16,20 +16,27 @@ import (
 )
 
 // BotVerificationStore is the PostgreSQL implementation of third-party bot
-// verification (migration 0155): the icon catalogue, verifier status, the granted
-// marks and the application queue in front of them.
+// verification (migrations 0155 + 0208): the icon catalogue, the verifier
+// organizations, the granted marks and the application queue in front of them.
+// 0208 replaced the one-row-per-bot bot_verifier_settings with
+// verifier_organizations: a bot is a verifier through the organizations it
+// hosts, and its settings block plus every projection is resolved from its
+// PRIMARY organization (lowest display_priority).
 //
 // Four properties are load bearing and every method below exists to keep them:
 //
 //   - The projection is deterministic and cheap. PeerVerification and
 //     PeerVerificationBatch run on every peer serialisation, so the batch form is
-//     a single query for all peers (no N+1). The peer unique constraint matches
-//     the wire model's single BotVerification value.
+//     a single query for all peers (no N+1). The wire model carries one
+//     BotVerification per peer, so a tie between several organizations' marks on
+//     one peer resolves to a single winner: lowest display_priority, then most
+//     recently granted, then newest row. Losers stay on disk and surface when the
+//     winner is revoked.
 //   - A disabled verifier projects nothing. Both projection reads join
-//     bot_verifier_settings and keep only enabled verifiers, which is the
-//     operator kill switch: flipping enabled off darkens every badge that
-//     verifier granted while the rows stay on disk, so flipping it back restores
-//     them unchanged.
+//     verifier_organizations and keep only enabled organizations. The operator
+//     kill switch (SetBotVerifierEnabled / SetVerifierOrganizationEnabled) flips
+//     enabled off: every badge those organizations granted darkens while the rows
+//     stay on disk, so flipping it back restores them unchanged.
 //   - "approved implies the mark exists". DecideCustomVerificationRequest changes
 //     the application status and grants (or revokes) the mark in ONE transaction:
 //     the caller-supplied apply callback runs inside it and must write through
@@ -93,7 +100,7 @@ const (
 // pre-check would have.
 const (
 	verificationIconDocumentConstraint    = "verification_icons_document_id_key"
-	customVerificationOnceConstraint      = "custom_verifications_peer_once"
+	customVerificationOnceConstraint      = "custom_verifications_org_peer_once"
 	customVerificationRequestPendingIndex = "custom_verification_requests_pending_idx"
 )
 
@@ -102,16 +109,22 @@ const (
 	verificationIconColumnList = `id, document_id, owner_bot_id, name, active,
        created_at, updated_at`
 
-	botVerifierSettingsColumnList = `bot_id, icon_document_id, company_name,
-       default_description, can_modify_custom_description, enabled, granted_by,
-       grant_reason, created_at, updated_at, version`
+	verifierOrganizationColumnList = `id, verifier_bot_id, company_name,
+       icon_document_id, default_description, can_modify_custom_description,
+       enabled, display_priority, granted_by, grant_reason, created_at,
+       updated_at, version`
 
-	customVerificationColumnList = `id, verifier_bot_id, peer_type, peer_id,
-       icon_document_id, description, granted_by_user_id, created_at, updated_at,
-       version`
+	// botVerifierSettingsColumnList is a backwards-compatible name: the legacy
+	// settings block is a projection of the bot's primary organization row, so
+	// the two projections share the same column list and scanner.
+	botVerifierSettingsColumnList = verifierOrganizationColumnList
 
-	customVerificationRequestColumnList = `id, verifier_bot_id, applicant_user_id,
-       peer_type, peer_id, peer_title, peer_username, reason,
+	customVerificationColumnList = `id, organization_id, verifier_bot_id,
+       peer_type, peer_id, icon_document_id, description, granted_by_user_id,
+       granted_at, created_at, updated_at, version`
+
+	customVerificationRequestColumnList = `id, verifier_bot_id, organization_id,
+       applicant_user_id, peer_type, peer_id, peer_title, peer_username, reason,
        requested_description, status, decided_by, decision_reason, internal_note,
        correlation_id, created_at, updated_at, approved_at, rejected_at, version`
 )
@@ -273,13 +286,20 @@ LIMIT $2`, activeOnly, limit)
 
 // ---- verifier status --------------------------------------------------------
 
-// UpsertBotVerifierSettings grants or updates verifier status.
+// The legacy bot-level view is synthesized from the bot's primary organization
+// (lowest display_priority, then newest row). A bot with no organizations is
+// not a verifier.
+
+// UpsertBotVerifierSettings grants or updates verifier status through the bot's
+// PRIMARY organization. The 0155 bot-level API is deliberately kept: an
+// operator/verifierbot that only ever knows one verifier per bot keeps working,
+// and the built-in @verifierbot becomes a bot with (so far) one organization.
 //
-// settings.Version is the optimistic-locking expectation: 0 means "there is no
-// verifier row yet" and a stored row then reports
-// domain.ErrCustomVerificationVersionConflict, and a non-zero version must match
-// the stored one. created_at is never rewritten, so the grant date survives every
-// later edit.
+// settings.Version is the optimistic-locking expectation: 0 means "the bot has
+// no organization yet", and a bot that already has one then reports
+// domain.ErrCustomVerificationVersionConflict; a non-zero version must match the
+// stored primary organization's. created_at is never rewritten, so the grant
+// date survives every later edit.
 func (s *BotVerificationStore) UpsertBotVerifierSettings(ctx context.Context, settings domain.BotVerifierSettings) (domain.BotVerifierSettings, error) {
 	if s == nil || s.db == nil {
 		return domain.BotVerifierSettings{}, fmt.Errorf("bot verification store is not configured")
@@ -296,38 +316,38 @@ func (s *BotVerificationStore) UpsertBotVerifierSettings(ctx context.Context, se
 	}
 	var stored domain.BotVerifierSettings
 	err := withTx(ctx, s.db, "upsert bot verifier settings", func(tx pgx.Tx) error {
-		current, err := lockBotVerifierSettingsTx(ctx, tx, settings.BotID)
-		switch {
-		case errors.Is(err, domain.ErrVerifierNotFound):
-			if settings.Version != 0 {
-				// The caller edits a row that is no longer there.
-				return domain.ErrVerifierNotFound
-			}
-			now := botVerificationNow()
-			inserted, err := scanBotVerifierSettings(tx.QueryRow(ctx, `
-INSERT INTO bot_verifier_settings (
-  bot_id, icon_document_id, company_name, default_description,
-  can_modify_custom_description, enabled, granted_by, grant_reason,
-  created_at, updated_at, version
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,1)
-RETURNING `+botVerifierSettingsColumnList,
-				settings.BotID, settings.IconDocumentID, settings.CompanyName,
-				settings.DefaultDescription, settings.CanModifyCustomDescription,
-				settings.Enabled, settings.GrantedBy, settings.GrantReason, now,
-			))
-			if err != nil {
-				return fmt.Errorf("insert bot verifier settings: %w", err)
-			}
-			stored = inserted
-			return nil
-		case err != nil:
+		orgs, err := lockBotOrganizationsTx(ctx, tx, settings.BotID)
+		if err != nil {
 			return err
 		}
-		if settings.Version == 0 || settings.Version != current.Version {
+		if len(orgs) == 0 {
+			// Granting a fresh verifier creates its primary organization at the
+			// default rank, exactly the shape the old settings row had.
+			now := botVerificationNow()
+			inserted, err := scanVerifierOrganization(tx.QueryRow(ctx, `
+INSERT INTO verifier_organizations (
+  verifier_bot_id, company_name, icon_document_id, default_description,
+  can_modify_custom_description, enabled, display_priority, granted_by,
+  grant_reason, created_at, updated_at, version
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,1)
+RETURNING `+verifierOrganizationColumnList,
+				settings.BotID, settings.CompanyName, settings.IconDocumentID,
+				settings.DefaultDescription, settings.CanModifyCustomDescription,
+				settings.Enabled, domain.DefaultVerifierDisplayPriority,
+				settings.GrantedBy, settings.GrantReason, now,
+			))
+			if err != nil {
+				return fmt.Errorf("insert verifier organization: %w", err)
+			}
+			stored = inserted.SettingsFor()
+			return nil
+		}
+		primary := primaryOrganizationOf(orgs)
+		if settings.Version == 0 || settings.Version != primary.Version {
 			return domain.ErrCustomVerificationVersionConflict
 		}
-		updated, err := scanBotVerifierSettings(tx.QueryRow(ctx, `
-UPDATE bot_verifier_settings
+		updated, err := scanVerifierOrganization(tx.QueryRow(ctx, `
+UPDATE verifier_organizations
 SET icon_document_id = $3,
     company_name = $4,
     default_description = $5,
@@ -337,9 +357,9 @@ SET icon_document_id = $3,
     grant_reason = $9,
     version = version + 1,
     updated_at = GREATEST(updated_at, $10)
-WHERE bot_id = $1 AND version = $2
-RETURNING `+botVerifierSettingsColumnList,
-			settings.BotID, settings.Version, settings.IconDocumentID,
+WHERE id = $1 AND version = $2
+RETURNING `+verifierOrganizationColumnList,
+			primary.ID, settings.Version, settings.IconDocumentID,
 			settings.CompanyName, settings.DefaultDescription,
 			settings.CanModifyCustomDescription, settings.Enabled,
 			settings.GrantedBy, settings.GrantReason, botVerificationNow(),
@@ -350,7 +370,7 @@ RETURNING `+botVerifierSettingsColumnList,
 		if err != nil {
 			return fmt.Errorf("update bot verifier settings: %w", err)
 		}
-		stored = updated
+		stored = updated.SettingsFor()
 		return nil
 	})
 	if err != nil {
@@ -359,11 +379,12 @@ RETURNING `+botVerifierSettingsColumnList,
 	return stored, nil
 }
 
-// SetBotVerifierEnabled flips the operator kill switch. Existing marks stay on
-// disk, but the verifier can grant nothing new and neither its settings nor its
-// marks are projected, so flipping the switch back restores exactly what was
-// there. Setting the flag to the value it already has is a no-op and does not
-// burn a version.
+// SetBotVerifierEnabled flips the operator kill switch across every organization
+// of the bot, which is what "disable this verifier" means now that one bot can
+// front several organizations. Existing marks stay on disk, but the bot can
+// grant nothing new and neither its settings nor its marks are projected, so
+// flipping the switch back restores exactly what was there. Setting the flag to
+// the value it already holds is a no-op and does not burn a version.
 func (s *BotVerificationStore) SetBotVerifierEnabled(ctx context.Context, botID int64, enabled bool) (domain.BotVerifierSettings, error) {
 	if s == nil || s.db == nil {
 		return domain.BotVerifierSettings{}, fmt.Errorf("bot verification store is not configured")
@@ -373,23 +394,40 @@ func (s *BotVerificationStore) SetBotVerifierEnabled(ctx context.Context, botID 
 	}
 	var stored domain.BotVerifierSettings
 	err := withTx(ctx, s.db, "set bot verifier enabled", func(tx pgx.Tx) error {
-		current, err := lockBotVerifierSettingsTx(ctx, tx, botID)
+		orgs, err := lockBotOrganizationsTx(ctx, tx, botID)
 		if err != nil {
 			return err
 		}
-		if current.Enabled == enabled {
-			stored = current
+		if len(orgs) == 0 {
+			return domain.ErrVerifierNotFound
+		}
+		unchanged := true
+		for _, org := range orgs {
+			if org.Enabled != enabled {
+				unchanged = false
+				break
+			}
+		}
+		if unchanged {
+			stored = primaryOrganizationOf(orgs).SettingsFor()
 			return nil
 		}
-		updated, err := scanBotVerifierSettings(tx.QueryRow(ctx, `
-UPDATE bot_verifier_settings
+		if _, err := tx.Exec(ctx, `
+UPDATE verifier_organizations
 SET enabled = $2, version = version + 1, updated_at = GREATEST(updated_at, $3)
-WHERE bot_id = $1
-RETURNING `+botVerifierSettingsColumnList, botID, enabled, botVerificationNow()))
-		if err != nil {
+WHERE verifier_bot_id = $1`, botID, enabled, botVerificationNow()); err != nil {
 			return fmt.Errorf("set bot verifier enabled: %w", err)
 		}
-		stored = updated
+		reloaded, err := scanVerifierOrganization(tx.QueryRow(ctx, `
+SELECT `+verifierOrganizationColumnList+`
+FROM verifier_organizations
+WHERE verifier_bot_id = $1
+ORDER BY display_priority, id
+LIMIT 1`, botID))
+		if err != nil {
+			return fmt.Errorf("reload primary verifier organization: %w", err)
+		}
+		stored = reloaded.SettingsFor()
 		return nil
 	})
 	if err != nil {
@@ -398,10 +436,12 @@ RETURNING `+botVerifierSettingsColumnList, botID, enabled, botVerificationNow())
 	return stored, nil
 }
 
-// DeleteBotVerifierSettings removes verifier status. Its marks cascade away with
-// it (custom_verifications.verifier_bot_id ON DELETE CASCADE), because a mark
-// whose verifier no longer exists has nothing to render. Applications survive:
-// they reference users, not the verifier row, and stay as history.
+// DeleteBotVerifierSettings removes verifier status by deleting every
+// organization of the bot. The organizations' marks cascade away with them
+// (custom_verifications.organization_id ON DELETE CASCADE), because a mark whose
+// verifier no longer exists has nothing to render. Applications survive: their
+// organization_id is cleared (ON DELETE SET NULL) and the applicant
+// reference stays, so the review history is preserved.
 func (s *BotVerificationStore) DeleteBotVerifierSettings(ctx context.Context, botID int64) (bool, error) {
 	if s == nil || s.db == nil {
 		return false, fmt.Errorf("bot verification store is not configured")
@@ -409,16 +449,16 @@ func (s *BotVerificationStore) DeleteBotVerifierSettings(ctx context.Context, bo
 	if botID <= 0 {
 		return false, domain.ErrVerifierNotFound
 	}
-	tag, err := s.db.Exec(ctx, `DELETE FROM bot_verifier_settings WHERE bot_id = $1`, botID)
+	tag, err := s.db.Exec(ctx, `DELETE FROM verifier_organizations WHERE verifier_bot_id = $1`, botID)
 	if err != nil {
-		return false, fmt.Errorf("delete bot verifier settings: %w", err)
+		return false, fmt.Errorf("delete verifier organizations: %w", err)
 	}
 	return tag.RowsAffected() > 0, nil
 }
 
-// BotVerifierSettings reads one verifier's status, enabled or not: the caller
-// needs the disabled row too, to render the kill switch and to explain
-// BOT_VERIFIER_FORBIDDEN.
+// BotVerifierSettings reads one verifier's status (its primary organization),
+// enabled or not: the caller needs the disabled row too, to render the kill
+// switch and to explain BOT_VERIFIER_FORBIDDEN.
 func (s *BotVerificationStore) BotVerifierSettings(ctx context.Context, botID int64) (domain.BotVerifierSettings, error) {
 	if s == nil || s.db == nil {
 		return domain.BotVerifierSettings{}, fmt.Errorf("bot verification store is not configured")
@@ -427,9 +467,11 @@ func (s *BotVerificationStore) BotVerifierSettings(ctx context.Context, botID in
 		return domain.BotVerifierSettings{}, domain.ErrVerifierNotFound
 	}
 	settings, err := scanBotVerifierSettings(s.db.QueryRow(ctx, `
-SELECT `+botVerifierSettingsColumnList+`
-FROM bot_verifier_settings
-WHERE bot_id = $1`, botID))
+SELECT `+verifierOrganizationColumnList+`
+FROM verifier_organizations
+WHERE verifier_bot_id = $1
+ORDER BY display_priority, id
+LIMIT 1`, botID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.BotVerifierSettings{}, domain.ErrVerifierNotFound
 	}
@@ -465,38 +507,44 @@ func (s *BotVerificationStore) BotVerifierSettingsBatch(ctx context.Context, bot
 		return out, nil
 	}
 	rows, err := s.db.Query(ctx, `
-SELECT `+botVerifierSettingsColumnList+`
-FROM bot_verifier_settings
-WHERE bot_id = ANY($1::bigint[])`, ids)
+SELECT DISTINCT ON (o.verifier_bot_id) `+verifierOrganizationColumnList+`
+FROM verifier_organizations o
+WHERE o.verifier_bot_id = ANY($1::bigint[])
+ORDER BY o.verifier_bot_id, o.display_priority, o.id`, ids)
 	if err != nil {
 		return nil, fmt.Errorf("batch bot verifier settings: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		settings, err := scanBotVerifierSettings(rows)
+		org, err := scanVerifierOrganization(rows)
 		if err != nil {
-			return nil, fmt.Errorf("scan bot verifier settings: %w", err)
+			return nil, fmt.Errorf("scan bot verifier organization: %w", err)
 		}
-		out[settings.BotID] = settings
+		out[org.VerifierBotID] = org.SettingsFor()
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate bot verifier settings: %w", err)
+		return nil, fmt.Errorf("iterate bot verifier organizations: %w", err)
 	}
 	return out, nil
 }
 
-// ListBotVerifiers lists verifier bots for the admin panel, ordered the way
-// bot_verifier_settings_enabled_idx is built.
+// ListBotVerifiers lists verifier bots for the admin panel, one entry per bot
+// carrying the primary organization's settings, ordered by bot id. enabledOnly
+// keeps bots whose PRIMARY organization is enabled.
 func (s *BotVerificationStore) ListBotVerifiers(ctx context.Context, enabledOnly bool, limit int) ([]domain.BotVerifierSettings, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("bot verification store is not configured")
 	}
 	limit = botVerificationLimit(limit)
 	rows, err := s.db.Query(ctx, `
-SELECT `+botVerifierSettingsColumnList+`
-FROM bot_verifier_settings
-WHERE NOT $1::boolean OR enabled
-ORDER BY bot_id
+SELECT p.*
+FROM (
+  SELECT DISTINCT ON (o.verifier_bot_id) `+verifierOrganizationColumnList+`
+  FROM verifier_organizations o
+  ORDER BY o.verifier_bot_id, o.display_priority, o.id
+) p
+WHERE NOT $1::boolean OR p.enabled
+ORDER BY p.verifier_bot_id
 LIMIT $2`, enabledOnly, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list bot verifiers: %w", err)
@@ -504,36 +552,265 @@ LIMIT $2`, enabledOnly, limit)
 	defer rows.Close()
 	out := make([]domain.BotVerifierSettings, 0, limit)
 	for rows.Next() {
-		settings, err := scanBotVerifierSettings(rows)
+		org, err := scanVerifierOrganization(rows)
 		if err != nil {
-			return nil, fmt.Errorf("scan bot verifier: %w", err)
+			return nil, fmt.Errorf("scan bot verifier organization: %w", err)
 		}
-		out = append(out, settings)
+		out = append(out, org.SettingsFor())
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate bot verifiers: %w", err)
+		return nil, fmt.Errorf("iterate bot verifier organizations: %w", err)
+	}
+	return out, nil
+}
+
+// ---- organizations ----------------------------------------------------------
+
+// UpsertVerifierOrganization creates (ID == 0) or updates an organization.
+// verifier_bot_id is immutable once set: marks and the wire projection hang off
+// the bot, so an update that would move the organization to another bot is
+// rejected. Version follows the settings convention: 0 means "no such
+// organization yet", and an edit must carry the stored version otherwise.
+func (s *BotVerificationStore) UpsertVerifierOrganization(ctx context.Context, org domain.VerifierOrganization) (domain.VerifierOrganization, error) {
+	if s == nil || s.db == nil {
+		return domain.VerifierOrganization{}, fmt.Errorf("bot verification store is not configured")
+	}
+	org.CompanyName = strings.TrimSpace(org.CompanyName)
+	org.DefaultDescription = strings.TrimSpace(org.DefaultDescription)
+	org.GrantedBy = strings.TrimSpace(org.GrantedBy)
+	org.GrantReason = strings.TrimSpace(org.GrantReason)
+	if err := org.Validate(); err != nil {
+		return domain.VerifierOrganization{}, err
+	}
+	if org.Version < 0 {
+		return domain.VerifierOrganization{}, domain.ErrVerifierSettingsInvalid
+	}
+	if org.ID == 0 {
+		now := botVerificationNow()
+		inserted, err := scanVerifierOrganization(s.db.QueryRow(ctx, `
+INSERT INTO verifier_organizations (
+  verifier_bot_id, company_name, icon_document_id, default_description,
+  can_modify_custom_description, enabled, display_priority, granted_by,
+  grant_reason, created_at, updated_at, version
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,1)
+RETURNING `+verifierOrganizationColumnList,
+			org.VerifierBotID, org.CompanyName, org.IconDocumentID,
+			org.DefaultDescription, org.CanModifyCustomDescription,
+			org.Enabled, org.DisplayPriority, org.GrantedBy, org.GrantReason, now,
+		))
+		if err != nil {
+			return domain.VerifierOrganization{}, fmt.Errorf("insert verifier organization: %w", err)
+		}
+		return inserted, nil
+	}
+	if org.Version == 0 {
+		return domain.VerifierOrganization{}, domain.ErrCustomVerificationVersionConflict
+	}
+	var stored domain.VerifierOrganization
+	err := withTx(ctx, s.db, "upsert verifier organization", func(tx pgx.Tx) error {
+		current, err := lockVerifierOrganizationTx(ctx, tx, org.ID)
+		if err != nil {
+			return err
+		}
+		if current.VerifierBotID != org.VerifierBotID {
+			return domain.ErrVerifierSettingsInvalid
+		}
+		if current.Version != org.Version {
+			return domain.ErrCustomVerificationVersionConflict
+		}
+		updated, err := scanVerifierOrganization(tx.QueryRow(ctx, `
+UPDATE verifier_organizations
+SET company_name = $3,
+    icon_document_id = $4,
+    default_description = $5,
+    can_modify_custom_description = $6,
+    enabled = $7,
+    display_priority = $8,
+    granted_by = $9,
+    grant_reason = $10,
+    version = version + 1,
+    updated_at = GREATEST(updated_at, $11)
+WHERE id = $1 AND version = $2
+RETURNING `+verifierOrganizationColumnList,
+			org.ID, org.Version, org.CompanyName, org.IconDocumentID,
+			org.DefaultDescription, org.CanModifyCustomDescription, org.Enabled,
+			org.DisplayPriority, org.GrantedBy, org.GrantReason, botVerificationNow(),
+		))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrCustomVerificationVersionConflict
+		}
+		if err != nil {
+			return fmt.Errorf("update verifier organization: %w", err)
+		}
+		stored = updated
+		return nil
+	})
+	if err != nil {
+		return domain.VerifierOrganization{}, err
+	}
+	return stored, nil
+}
+
+// SetVerifierOrganizationEnabled flips one organization's enable bit. The mark
+// rows stay on disk; only the projection stops rendering them. Setting the flag
+// to its current value is a no-op.
+func (s *BotVerificationStore) SetVerifierOrganizationEnabled(ctx context.Context, organizationID int64, enabled bool) (domain.VerifierOrganization, error) {
+	if s == nil || s.db == nil {
+		return domain.VerifierOrganization{}, fmt.Errorf("bot verification store is not configured")
+	}
+	if organizationID <= 0 {
+		return domain.VerifierOrganization{}, domain.ErrOrganizationNotFound
+	}
+	var stored domain.VerifierOrganization
+	err := withTx(ctx, s.db, "set verifier organization enabled", func(tx pgx.Tx) error {
+		current, err := lockVerifierOrganizationTx(ctx, tx, organizationID)
+		if err != nil {
+			return err
+		}
+		if current.Enabled == enabled {
+			stored = current
+			return nil
+		}
+		updated, err := scanVerifierOrganization(tx.QueryRow(ctx, `
+UPDATE verifier_organizations
+SET enabled = $2, version = version + 1, updated_at = GREATEST(updated_at, $3)
+WHERE id = $1
+RETURNING `+verifierOrganizationColumnList, organizationID, enabled, botVerificationNow()))
+		if err != nil {
+			return fmt.Errorf("set verifier organization enabled: %w", err)
+		}
+		stored = updated
+		return nil
+	})
+	if err != nil {
+		return domain.VerifierOrganization{}, err
+	}
+	return stored, nil
+}
+
+// DeleteVerifierOrganization removes one organization. Its marks cascade away;
+// applications it staged keep their history with organization_id cleared.
+func (s *BotVerificationStore) DeleteVerifierOrganization(ctx context.Context, organizationID int64) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, fmt.Errorf("bot verification store is not configured")
+	}
+	if organizationID <= 0 {
+		return false, domain.ErrOrganizationNotFound
+	}
+	tag, err := s.db.Exec(ctx, `DELETE FROM verifier_organizations WHERE id = $1`, organizationID)
+	if err != nil {
+		return false, fmt.Errorf("delete verifier organization: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// VerifierOrganization reads one organization by id.
+func (s *BotVerificationStore) VerifierOrganization(ctx context.Context, organizationID int64) (domain.VerifierOrganization, error) {
+	if s == nil || s.db == nil {
+		return domain.VerifierOrganization{}, fmt.Errorf("bot verification store is not configured")
+	}
+	if organizationID <= 0 {
+		return domain.VerifierOrganization{}, domain.ErrOrganizationNotFound
+	}
+	org, err := scanVerifierOrganization(s.db.QueryRow(ctx, `
+SELECT `+verifierOrganizationColumnList+`
+FROM verifier_organizations
+WHERE id = $1`, organizationID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.VerifierOrganization{}, domain.ErrOrganizationNotFound
+	}
+	if err != nil {
+		return domain.VerifierOrganization{}, fmt.Errorf("get verifier organization: %w", err)
+	}
+	return org, nil
+}
+
+// VerifierOrganizationsByBot lists one bot's organizations ranked by
+// display_priority, so the first entry is always the primary. enabledOnly drops
+// disabled ones.
+func (s *BotVerificationStore) VerifierOrganizationsByBot(ctx context.Context, verifierBotID int64, enabledOnly bool) ([]domain.VerifierOrganization, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("bot verification store is not configured")
+	}
+	if verifierBotID <= 0 {
+		return nil, domain.ErrVerifierNotFound
+	}
+	rows, err := s.db.Query(ctx, `
+SELECT `+verifierOrganizationColumnList+`
+FROM verifier_organizations
+WHERE verifier_bot_id = $1 AND (NOT $2::boolean OR enabled)
+ORDER BY display_priority, id`, verifierBotID, enabledOnly)
+	if err != nil {
+		return nil, fmt.Errorf("list verifier organizations: %w", err)
+	}
+	defer rows.Close()
+	out := make([]domain.VerifierOrganization, 0, 4)
+	for rows.Next() {
+		org, err := scanVerifierOrganization(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan verifier organization: %w", err)
+		}
+		out = append(out, org)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate verifier organizations: %w", err)
+	}
+	return out, nil
+}
+
+// ListVerifierOrganizations is the admin catalogue, grouped by verifier bot.
+func (s *BotVerificationStore) ListVerifierOrganizations(ctx context.Context, enabledOnly bool, limit int) ([]domain.VerifierOrganization, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("bot verification store is not configured")
+	}
+	limit = botVerificationLimit(limit)
+	rows, err := s.db.Query(ctx, `
+SELECT `+verifierOrganizationColumnList+`
+FROM verifier_organizations
+WHERE NOT $1::boolean OR enabled
+ORDER BY verifier_bot_id, display_priority, id
+LIMIT $2`, enabledOnly, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list verifier organizations: %w", err)
+	}
+	defer rows.Close()
+	out := make([]domain.VerifierOrganization, 0, limit)
+	for rows.Next() {
+		org, err := scanVerifierOrganization(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan verifier organization: %w", err)
+		}
+		out = append(out, org)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate verifier organizations: %w", err)
 	}
 	return out, nil
 }
 
 // ---- granted marks ---------------------------------------------------------
 
-// GrantCustomVerification creates or updates this verifier's mark on the peer.
+// GrantCustomVerification creates or updates the mark a verifier bot owns on a
+// peer, scoped to one ORGANIZATION (mark.OrganizationID; a zero value resolves
+// to the bot's primary organization).
 //
-// custom_verifications_peer_once makes the peer the identity of a mark. A repeat
-// by the same verifier updates in place; a different verifier replaces the mark
-// because the wire model can carry only one BotVerification.
+// custom_verifications_org_peer_once makes (organization, peer) the identity of
+// a mark. A repeat by the same organization updates in place; marks of other
+// organizations of the same bot coexist and the projection picks the winner, so
+// unlike 0155 nothing is squeezed out at write time.
 //
-// The verifier row is locked first: it is both the existence check
-// (domain.ErrVerifierNotFound) and the serialisation point that makes the
-// per-verifier bound real. Two concurrent grants by one verifier queue up, so
-// the count they check cannot go stale between the check and the insert and
-// domain.MaxCustomVerificationsPerVerifier cannot be overshot.
+// The bot's organizations are locked first: the primary row is the existence
+// check (domain.ErrVerifierNotFound) and the whole set is the serialisation
+// point that makes the per-verifier bound real. Two concurrent grants by one bot
+// queue up, so the count they check cannot go stale between the check and the
+// insert and domain.MaxCustomVerificationsPerVerifier cannot be overshot.
 //
-// mark.IconDocumentID is denormalised from the verifier's settings when the
+// mark.IconDocumentID is denormalised from the organization's settings when the
 // caller leaves it unset, which is what "the icon is taken from the verifier at
 // grant time" means; an explicit id is honoured, so re-issuing a historical mark
-// keeps its original icon.
+// keeps its original icon. granted_at records when the mark won: it is set on a
+// fresh grant and preserved on an in-place update, and feeds the winner
+// tie-break (newest granted wins).
 func (s *BotVerificationStore) GrantCustomVerification(ctx context.Context, mark domain.CustomVerification) (domain.CustomVerification, bool, error) {
 	if s == nil || s.db == nil {
 		return domain.CustomVerification{}, false, fmt.Errorf("bot verification store is not configured")
@@ -551,18 +828,26 @@ func (s *BotVerificationStore) GrantCustomVerification(ctx context.Context, mark
 	var stored domain.CustomVerification
 	created := false
 	err := withTx(ctx, s.db, "grant custom verification", func(tx pgx.Tx) error {
-		settings, err := lockBotVerifierSettingsTx(ctx, tx, mark.VerifierBotID)
+		orgs, err := lockBotOrganizationsTx(ctx, tx, mark.VerifierBotID)
 		if err != nil {
 			return err
 		}
+		if len(orgs) == 0 {
+			return domain.ErrVerifierNotFound
+		}
+		org, err := resolveOrganizationOf(orgs, mark.OrganizationID)
+		if err != nil {
+			return err
+		}
+		mark.OrganizationID = org.ID
 		if mark.IconDocumentID <= 0 {
-			mark.IconDocumentID = settings.IconDocumentID
+			mark.IconDocumentID = org.IconDocumentID
 		}
 		if err := mark.Validate(); err != nil {
 			return err
 		}
 		existed := true
-		switch _, err := customVerificationTx(ctx, tx, mark.VerifierBotID, mark.Peer, true); {
+		switch _, err := customVerificationTx(ctx, tx, org.ID, mark.Peer, true); {
 		case err == nil:
 		case errors.Is(err, domain.ErrCustomVerificationNotFound):
 			existed = false
@@ -581,23 +866,29 @@ func (s *BotVerificationStore) GrantCustomVerification(ctx context.Context, mark
 		now := botVerificationNow()
 		upserted, err := scanCustomVerification(tx.QueryRow(ctx, `
 INSERT INTO custom_verifications (
-  verifier_bot_id, peer_type, peer_id, icon_document_id, description,
-  granted_by_user_id, created_at, updated_at, version
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$7,1)
+  organization_id, verifier_bot_id, peer_type, peer_id, icon_document_id,
+  description, granted_by_user_id, granted_at, created_at, updated_at, version
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$8,1)
 ON CONFLICT ON CONSTRAINT `+customVerificationOnceConstraint+` DO UPDATE
-SET verifier_bot_id = EXCLUDED.verifier_bot_id,
+SET organization_id = EXCLUDED.organization_id,
+    verifier_bot_id = EXCLUDED.verifier_bot_id,
     icon_document_id = EXCLUDED.icon_document_id,
     description = EXCLUDED.description,
     granted_by_user_id = EXCLUDED.granted_by_user_id,
+    granted_at = CASE
+      WHEN custom_verifications.organization_id = EXCLUDED.organization_id
+        THEN custom_verifications.granted_at
+      ELSE EXCLUDED.granted_at
+    END,
     created_at = CASE
-      WHEN custom_verifications.verifier_bot_id = EXCLUDED.verifier_bot_id
+      WHEN custom_verifications.organization_id = EXCLUDED.organization_id
         THEN custom_verifications.created_at
       ELSE EXCLUDED.created_at
     END,
     version = custom_verifications.version + 1,
     updated_at = GREATEST(custom_verifications.updated_at, EXCLUDED.updated_at)
 RETURNING `+customVerificationColumnList,
-			mark.VerifierBotID, string(mark.Peer.Type), mark.Peer.ID,
+			mark.OrganizationID, mark.VerifierBotID, string(mark.Peer.Type), mark.Peer.ID,
 			mark.IconDocumentID, mark.Description, mark.GrantedByUserID, now,
 		))
 		if err != nil {
@@ -613,10 +904,12 @@ RETURNING `+customVerificationColumnList,
 	return stored, created, nil
 }
 
-// RevokeCustomVerification removes this verifier's mark from the peer and
-// reports whether anything was removed, so a repeated revoke is a no-op instead
-// of an error. Only this verifier's mark goes: another verifier's mark on the
-// same peer is none of its business.
+// RevokeCustomVerification removes this verifier bot's WINNING mark from the
+// peer -- the one its projection would show -- and reports whether anything was
+// removed, so a repeated revoke is a no-op instead of an error. When the bot
+// hosts several organizations, the winner's mark goes, exposing the next
+// organization's mark as the rendered badge, which is the "revoked the badge the
+// peer sees" behaviour.
 func (s *BotVerificationStore) RevokeCustomVerification(ctx context.Context, verifierBotID int64, peer domain.Peer) (bool, error) {
 	if s == nil || s.db == nil {
 		return false, fmt.Errorf("bot verification store is not configured")
@@ -626,7 +919,15 @@ func (s *BotVerificationStore) RevokeCustomVerification(ctx context.Context, ver
 	}
 	tag, err := s.db.Exec(ctx, `
 DELETE FROM custom_verifications
-WHERE verifier_bot_id = $1 AND peer_type = $2 AND peer_id = $3`,
+WHERE peer_type = $2 AND peer_id = $3
+  AND id = (
+    SELECT cv.id
+    FROM custom_verifications cv
+    JOIN verifier_organizations o ON o.id = cv.organization_id
+    WHERE o.verifier_bot_id = $1 AND cv.peer_type = $2 AND cv.peer_id = $3
+    ORDER BY o.display_priority, cv.granted_at DESC, cv.id DESC
+    LIMIT 1
+  )`,
 		verifierBotID, string(peer.Type), peer.ID)
 	if err != nil {
 		return false, fmt.Errorf("revoke custom verification: %w", err)
@@ -634,9 +935,29 @@ WHERE verifier_bot_id = $1 AND peer_type = $2 AND peer_id = $3`,
 	return tag.RowsAffected() > 0, nil
 }
 
-// CustomVerification reads one verifier's mark on a peer, whether or not that
-// verifier is currently enabled: this is the bookkeeping read, not the
-// projection.
+// RevokeOrganizationMark removes one organization's mark on a peer, whether or
+// not it is the projection winner. This is the precise path for admin revokes
+// and for clearing a sold organization's mark so the peer's slot frees up.
+func (s *BotVerificationStore) RevokeOrganizationMark(ctx context.Context, organizationID int64, peer domain.Peer) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, fmt.Errorf("bot verification store is not configured")
+	}
+	if organizationID <= 0 || !validBotVerificationPeer(peer) {
+		return false, domain.ErrCustomVerificationTargetInvalid
+	}
+	tag, err := s.db.Exec(ctx, `
+DELETE FROM custom_verifications
+WHERE organization_id = $1 AND peer_type = $2 AND peer_id = $3`,
+		organizationID, string(peer.Type), peer.ID)
+	if err != nil {
+		return false, fmt.Errorf("revoke organization mark: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// CustomVerification reads this verifier bot's WINNING mark on a peer (the one
+// rendered under the bot), whether or not that verifier is currently enabled:
+// this is the bookkeeping read, not the projection.
 func (s *BotVerificationStore) CustomVerification(ctx context.Context, verifierBotID int64, peer domain.Peer) (domain.CustomVerification, error) {
 	if s == nil || s.db == nil {
 		return domain.CustomVerification{}, fmt.Errorf("bot verification store is not configured")
@@ -644,14 +965,33 @@ func (s *BotVerificationStore) CustomVerification(ctx context.Context, verifierB
 	if verifierBotID <= 0 || !validBotVerificationPeer(peer) {
 		return domain.CustomVerification{}, domain.ErrCustomVerificationNotFound
 	}
-	return customVerificationTx(ctx, s.db, verifierBotID, peer, false)
+	mark, err := scanCustomVerification(s.db.QueryRow(ctx, `
+SELECT `+customVerificationJoinColumns+`
+FROM custom_verifications cv
+JOIN verifier_organizations o ON o.id = cv.organization_id
+WHERE o.verifier_bot_id = $1 AND cv.peer_type = $2 AND cv.peer_id = $3
+ORDER BY o.display_priority, cv.granted_at DESC, cv.id DESC
+LIMIT 1`, verifierBotID, string(peer.Type), peer.ID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.CustomVerification{}, domain.ErrCustomVerificationNotFound
+	}
+	if err != nil {
+		return domain.CustomVerification{}, fmt.Errorf("get verifier custom verification: %w", err)
+	}
+	return mark, nil
 }
 
-// PeerVerification returns the mark a peer is rendered with.
-//
-// Only an enabled verifier projects. The schema guarantees one mark per peer;
-// ORDER BY remains a defensive stable read for databases created during
-// development before that invariant was folded into the initial migration.
+// OrganizationCustomVerification reads one organization's mark on a peer, winner
+// or not.
+func (s *BotVerificationStore) OrganizationCustomVerification(ctx context.Context, organizationID int64, peer domain.Peer) (domain.CustomVerification, error) {
+	if s == nil || s.db == nil {
+		return domain.CustomVerification{}, fmt.Errorf("bot verification store is not configured")
+	}
+	return customVerificationTx(ctx, s.db, organizationID, peer, false)
+}
+
+// PeerVerification returns the mark a peer is rendered with: the winner of the
+// tie between every enabled organization marking the peer.
 func (s *BotVerificationStore) PeerVerification(ctx context.Context, peer domain.Peer) (domain.CustomVerification, error) {
 	if s == nil || s.db == nil {
 		return domain.CustomVerification{}, fmt.Errorf("bot verification store is not configured")
@@ -662,9 +1002,9 @@ func (s *BotVerificationStore) PeerVerification(ctx context.Context, peer domain
 	mark, err := scanCustomVerification(s.db.QueryRow(ctx, `
 SELECT `+customVerificationJoinColumns+`
 FROM custom_verifications cv
-JOIN bot_verifier_settings s ON s.bot_id = cv.verifier_bot_id AND s.enabled
+JOIN verifier_organizations o ON o.id = cv.organization_id AND o.enabled
 WHERE cv.peer_type = $1 AND cv.peer_id = $2
-ORDER BY cv.id DESC
+ORDER BY o.display_priority, cv.granted_at DESC, cv.id DESC
 LIMIT 1`, string(peer.Type), peer.ID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.CustomVerification{}, domain.ErrCustomVerificationNotFound
@@ -678,10 +1018,10 @@ LIMIT 1`, string(peer.Type), peer.ID))
 // PeerVerificationBatch resolves the projection for many peers at once.
 //
 // This is the call on the hot serialisation path, so it is ONE query for the
-// whole batch: DISTINCT ON (peer_type, peer_id) with ORDER BY ... cv.id DESC
-// applies the same enabled-verifier rule per peer that PeerVerification would, and
-// peers without a mark are simply absent instead of erroring. Sending N queries
-// here would put a per-peer round trip on every dialog list.
+// whole batch: DISTINCT ON (peer_type, peer_id) with the same enabled-organization
+// winner ordering PeerVerification applies per peer, and peers without a mark are
+// simply absent instead of erroring. Sending N queries here would put a per-peer
+// round trip on every dialog list.
 func (s *BotVerificationStore) PeerVerificationBatch(ctx context.Context, peers []domain.Peer) (map[domain.Peer]domain.CustomVerification, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("bot verification store is not configured")
@@ -694,9 +1034,9 @@ func (s *BotVerificationStore) PeerVerificationBatch(ctx context.Context, peers 
 	rows, err := s.db.Query(ctx, `
 SELECT DISTINCT ON (cv.peer_type, cv.peer_id) `+customVerificationJoinColumns+`
 FROM custom_verifications cv
-JOIN bot_verifier_settings s ON s.bot_id = cv.verifier_bot_id AND s.enabled
+JOIN verifier_organizations o ON o.id = cv.organization_id AND o.enabled
 WHERE (cv.peer_type, cv.peer_id) IN (SELECT * FROM unnest($1::text[], $2::bigint[]))
-ORDER BY cv.peer_type, cv.peer_id, cv.id DESC`, types, ids)
+ORDER BY cv.peer_type, cv.peer_id, o.display_priority, cv.granted_at DESC, cv.id DESC`, types, ids)
 	if err != nil {
 		return nil, fmt.Errorf("batch peer verification: %w", err)
 	}
@@ -714,9 +1054,9 @@ ORDER BY cv.peer_type, cv.peer_id, cv.id DESC`, types, ids)
 	return out, nil
 }
 
-// CountCustomVerifications reports how many peers a verifier has marked, for the
-// per-verifier bound. Disabled verifiers still count their marks: the switch
-// hides badges, it does not free quota.
+// CountCustomVerifications reports how many peers a verifier bot has marked
+// across all its organizations, for the per-verifier bound. Disabled verifiers
+// still count their marks: the switch hides badges, it does not free quota.
 func (s *BotVerificationStore) CountCustomVerifications(ctx context.Context, verifierBotID int64) (int, error) {
 	if s == nil || s.db == nil {
 		return 0, fmt.Errorf("bot verification store is not configured")
@@ -730,10 +1070,11 @@ func (s *BotVerificationStore) CountCustomVerifications(ctx context.Context, ver
 // ListCustomVerifications is the admin listing query with keyset paging.
 //
 // Paging is keyset over id DESC (filter.BeforeID carries the last row of the
-// previous page), which is the tail of custom_verifications_verifier_idx and of
+// previous page), which is the tail of custom_verifications_org_idx and of
 // custom_verifications_peer_idx. Query matches a mark id or a peer id when it is
 // numeric and otherwise matches the description case-insensitively, the only
-// text a mark carries.
+// text a mark carries. When the filter names an OrganizationID, only that
+// organization's marks are listed.
 func (s *BotVerificationStore) ListCustomVerifications(ctx context.Context, filter domain.CustomVerificationFilter) ([]domain.CustomVerification, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("bot verification store is not configured")
@@ -746,20 +1087,21 @@ func (s *BotVerificationStore) ListCustomVerifications(ctx context.Context, filt
 	rows, err := s.db.Query(ctx, `
 SELECT `+customVerificationColumnList+`
 FROM custom_verifications
-WHERE ($1 = 0 OR verifier_bot_id = $1)
-  AND ($2 = '' OR peer_type = $2)
-  AND ($3 = 0 OR peer_id = $3)
-  AND ($4 = 0 OR id < $4)
+WHERE ($1 = 0 OR organization_id = $1)
+  AND ($2 = 0 OR verifier_bot_id = $2)
+  AND ($3 = '' OR peer_type = $3)
+  AND ($4 = 0 OR peer_id = $4)
+  AND ($5 = 0 OR id < $5)
   AND (
-    NOT $5::boolean
-    OR ($6::boolean AND (id = $7::bigint OR peer_id = $7::bigint))
-    OR (NOT $6::boolean AND lower(description) LIKE '%' || $8::text || '%')
+    NOT $6::boolean
+    OR ($7::boolean AND (id = $8::bigint OR peer_id = $8::bigint))
+    OR (NOT $7::boolean AND lower(description) LIKE '%' || $9::text || '%')
   )
 ORDER BY id DESC
-LIMIT $9`,
-		filter.VerifierBotID, string(filter.PeerType), filter.PeerID,
-		filter.BeforeID, isNumeric || needle != "", isNumeric, numeric,
-		escapeLike(needle), limit)
+LIMIT $10`,
+		filter.OrganizationID, filter.VerifierBotID, string(filter.PeerType),
+		filter.PeerID, filter.BeforeID, isNumeric || needle != "", isNumeric,
+		numeric, escapeLike(needle), limit)
 	if err != nil {
 		return nil, fmt.Errorf("list custom verifications: %w", err)
 	}
@@ -786,9 +1128,10 @@ LIMIT $9`,
 // decision field the caller pre-filled is dropped: only
 // DecideCustomVerificationRequest may write those.
 // custom_verification_requests_pending_idx allows one live application per
-// (verifier, peer), and a second one reports
+// (organization, peer), and a second one reports
 // domain.ErrCustomVerificationRequestExists -- two pending rows would let two
-// decisions race for one mark.
+// decisions race for one mark. A zero OrganizationID in the request is resolved
+// to the verifier bot's primary organization.
 func (s *BotVerificationStore) CreateCustomVerificationRequest(ctx context.Context, req domain.CustomVerificationRequest) (domain.CustomVerificationRequest, error) {
 	if s == nil || s.db == nil {
 		return domain.CustomVerificationRequest{}, fmt.Errorf("bot verification store is not configured")
@@ -808,17 +1151,23 @@ func (s *BotVerificationStore) CreateCustomVerificationRequest(ctx context.Conte
 	if err := validateCustomVerificationRequestColumns(req); err != nil {
 		return domain.CustomVerificationRequest{}, err
 	}
+	org, err := resolveOrganizationForBot(ctx, s.db, req.VerifierBotID, req.OrganizationID)
+	if err != nil {
+		return domain.CustomVerificationRequest{}, err
+	}
+	req.OrganizationID = org.ID
 	now := botVerificationNow()
 	stored, err := scanCustomVerificationRequest(s.db.QueryRow(ctx, `
 INSERT INTO custom_verification_requests (
-  verifier_bot_id, applicant_user_id, peer_type, peer_id, peer_title,
-  peer_username, reason, requested_description, status, internal_note,
-  correlation_id, created_at, updated_at, version
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$10,$11,$11,1)
+  verifier_bot_id, organization_id, applicant_user_id, peer_type, peer_id,
+  peer_title, peer_username, reason, requested_description, status,
+  internal_note, correlation_id, created_at, updated_at, version
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,$11,$12,$12,1)
 RETURNING `+customVerificationRequestColumnList,
-		req.VerifierBotID, req.ApplicantUserID, string(req.Peer.Type), req.Peer.ID,
-		req.PeerTitle, req.PeerUsername, req.Reason, req.RequestedDescription,
-		req.InternalNote, req.CorrelationID, now,
+		req.VerifierBotID, req.OrganizationID, req.ApplicantUserID,
+		string(req.Peer.Type), req.Peer.ID, req.PeerTitle, req.PeerUsername,
+		req.Reason, req.RequestedDescription, req.InternalNote,
+		req.CorrelationID, now,
 	))
 	if err != nil {
 		if isUniqueConstraint(err, customVerificationRequestPendingIndex) {
@@ -958,8 +1307,9 @@ WHERE id = $1`, requestID))
 }
 
 // PendingCustomVerificationRequest returns the live application for a
-// (verifier, peer) pair. The partial unique index guarantees there is at most
-// one, so no ordering is needed to pick it.
+// (verifier, peer) pair, resolved through the bot's primary organization. The
+// partial unique index guarantees there is at most one per organization, so no
+// ordering is needed to pick it.
 func (s *BotVerificationStore) PendingCustomVerificationRequest(ctx context.Context, verifierBotID int64, peer domain.Peer) (domain.CustomVerificationRequest, error) {
 	if s == nil || s.db == nil {
 		return domain.CustomVerificationRequest{}, fmt.Errorf("bot verification store is not configured")
@@ -967,12 +1317,16 @@ func (s *BotVerificationStore) PendingCustomVerificationRequest(ctx context.Cont
 	if verifierBotID <= 0 || !validBotVerificationPeer(peer) {
 		return domain.CustomVerificationRequest{}, domain.ErrCustomVerificationRequestNotFound
 	}
+	org, err := resolveOrganizationForBot(ctx, s.db, verifierBotID, 0)
+	if err != nil {
+		return domain.CustomVerificationRequest{}, domain.ErrCustomVerificationRequestNotFound
+	}
 	req, err := scanCustomVerificationRequest(s.db.QueryRow(ctx, `
 SELECT `+customVerificationRequestColumnList+`
 FROM custom_verification_requests
-WHERE verifier_bot_id = $1 AND peer_type = $2 AND peer_id = $3
+WHERE organization_id = $1 AND peer_type = $2 AND peer_id = $3
   AND status = 'pending'
-LIMIT 1`, verifierBotID, string(peer.Type), peer.ID))
+LIMIT 1`, org.ID, string(peer.Type), peer.ID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.CustomVerificationRequest{}, domain.ErrCustomVerificationRequestNotFound
 	}
@@ -1009,22 +1363,24 @@ func (s *BotVerificationStore) ListCustomVerificationRequests(ctx context.Contex
 SELECT `+customVerificationRequestColumnList+`
 FROM custom_verification_requests
 WHERE (cardinality($1::text[]) = 0 OR status = ANY($1::text[]))
-  AND ($2 = 0 OR verifier_bot_id = $2)
-  AND ($3 = '' OR peer_type = $3)
-  AND ($4 = 0 OR id < $4)
+  AND ($2 = 0 OR organization_id = $2)
+  AND ($3 = 0 OR verifier_bot_id = $3)
+  AND ($4 = '' OR peer_type = $4)
+  AND ($5 = 0 OR id < $5)
   AND (
-    NOT $5::boolean
-    OR ($6::boolean AND (id = $7::bigint OR peer_id = $7::bigint))
+    NOT $6::boolean
+    OR ($7::boolean AND (id = $8::bigint OR peer_id = $8::bigint))
     OR (
-      NOT $6::boolean
+      NOT $7::boolean
       AND peer_username <> ''
-      AND lower(peer_username) LIKE $8::text || '%'
+      AND lower(peer_username) LIKE $9::text || '%'
     )
   )
 ORDER BY id DESC
-LIMIT $9`,
-		statuses, filter.VerifierBotID, string(filter.PeerType), filter.BeforeID,
-		isNumeric || prefix != "", isNumeric, numeric, escapeLike(prefix), limit)
+LIMIT $10`,
+		statuses, filter.OrganizationID, filter.VerifierBotID,
+		string(filter.PeerType), filter.BeforeID, isNumeric || prefix != "",
+		isNumeric, numeric, escapeLike(prefix), limit)
 	if err != nil {
 		return nil, fmt.Errorf("list custom verification requests: %w", err)
 	}
@@ -1120,36 +1476,141 @@ func scanVerificationIcon(row pgx.Row) (domain.VerificationIcon, error) {
 	return icon, nil
 }
 
-func scanBotVerifierSettings(row pgx.Row) (domain.BotVerifierSettings, error) {
-	var settings domain.BotVerifierSettings
-	if err := row.Scan(&settings.BotID, &settings.IconDocumentID,
-		&settings.CompanyName, &settings.DefaultDescription,
-		&settings.CanModifyCustomDescription, &settings.Enabled,
-		&settings.GrantedBy, &settings.GrantReason, &settings.CreatedAt,
-		&settings.UpdatedAt, &settings.Version); err != nil {
-		return domain.BotVerifierSettings{}, err
+func scanVerifierOrganization(row pgx.Row) (domain.VerifierOrganization, error) {
+	var org domain.VerifierOrganization
+	if err := row.Scan(&org.ID, &org.VerifierBotID, &org.CompanyName,
+		&org.IconDocumentID, &org.DefaultDescription,
+		&org.CanModifyCustomDescription, &org.Enabled, &org.DisplayPriority,
+		&org.GrantedBy, &org.GrantReason, &org.CreatedAt, &org.UpdatedAt,
+		&org.Version); err != nil {
+		return domain.VerifierOrganization{}, err
 	}
-	settings.CreatedAt = settings.CreatedAt.UTC()
-	settings.UpdatedAt = settings.UpdatedAt.UTC()
-	return settings, nil
+	org.CreatedAt = org.CreatedAt.UTC()
+	org.UpdatedAt = org.UpdatedAt.UTC()
+	return org, nil
 }
 
-// lockBotVerifierSettingsTx reads the verifier row for mutation. It is both the
-// existence check and the serialisation point every grant by that verifier goes
-// through, which is what makes the per-verifier bound hold under concurrency.
-func lockBotVerifierSettingsTx(ctx context.Context, tx pgx.Tx, botID int64) (domain.BotVerifierSettings, error) {
-	settings, err := scanBotVerifierSettings(tx.QueryRow(ctx, `
-SELECT `+botVerifierSettingsColumnList+`
-FROM bot_verifier_settings
-WHERE bot_id = $1
-FOR UPDATE`, botID))
+// scanBotVerifierSettings adapts a PRIMARY organization row to the legacy
+// bot-level settings view.
+func scanBotVerifierSettings(row pgx.Row) (domain.BotVerifierSettings, error) {
+	org, err := scanVerifierOrganization(row)
+	if err != nil {
+		return domain.BotVerifierSettings{}, err
+	}
+	return org.SettingsFor(), nil
+}
+
+// lockBotOrganizationsTx reads and locks every organization of a bot in id
+// order (stable lock order, so concurrent grants of the same bot cannot deadlock
+// against each other). The set is the serialisation point every grant and every
+// settings mutation by that bot goes through, which is what makes the
+// per-verifier bound hold under concurrency. An empty slice means the bot is not
+// a verifier; callers decide what that is worth.
+func lockBotOrganizationsTx(ctx context.Context, tx pgx.Tx, botID int64) ([]domain.VerifierOrganization, error) {
+	rows, err := tx.Query(ctx, `
+SELECT `+verifierOrganizationColumnList+`
+FROM verifier_organizations
+WHERE verifier_bot_id = $1
+ORDER BY id
+FOR UPDATE`, botID)
+	if err != nil {
+		return nil, fmt.Errorf("lock verifier organizations: %w", err)
+	}
+	defer rows.Close()
+	var orgs []domain.VerifierOrganization
+	for rows.Next() {
+		org, err := scanVerifierOrganization(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan locked verifier organization: %w", err)
+		}
+		orgs = append(orgs, org)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate locked verifier organizations: %w", err)
+	}
+	return orgs, nil
+}
+
+// lockVerifierOrganizationTx reads one organization for mutation.
+func lockVerifierOrganizationTx(ctx context.Context, tx pgx.Tx, organizationID int64) (domain.VerifierOrganization, error) {
+	org, err := scanVerifierOrganization(tx.QueryRow(ctx, `
+SELECT `+verifierOrganizationColumnList+`
+FROM verifier_organizations
+WHERE id = $1
+FOR UPDATE`, organizationID))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.BotVerifierSettings{}, domain.ErrVerifierNotFound
+		return domain.VerifierOrganization{}, domain.ErrOrganizationNotFound
 	}
 	if err != nil {
-		return domain.BotVerifierSettings{}, fmt.Errorf("lock bot verifier settings: %w", err)
+		return domain.VerifierOrganization{}, fmt.Errorf("lock verifier organization: %w", err)
 	}
-	return settings, nil
+	return org, nil
+}
+
+// primaryOrganizationOf picks the primary organization of a bot's locked set:
+// lowest display_priority, then newest row. The caller guarantees a non-empty
+// slice.
+func primaryOrganizationOf(orgs []domain.VerifierOrganization) domain.VerifierOrganization {
+	primary := orgs[0]
+	for _, org := range orgs[1:] {
+		if org.DisplayPriority < primary.DisplayPriority ||
+			(org.DisplayPriority == primary.DisplayPriority && org.ID < primary.ID) {
+			primary = org
+		}
+	}
+	return primary
+}
+
+// resolveOrganizationOf resolves a mark's organization within a bot's locked
+// set: zero means the primary, anything else must name an organization the bot
+// hosts.
+func resolveOrganizationOf(orgs []domain.VerifierOrganization, organizationID int64) (domain.VerifierOrganization, error) {
+	if organizationID == 0 {
+		return primaryOrganizationOf(orgs), nil
+	}
+	for _, org := range orgs {
+		if org.ID == organizationID {
+			return org, nil
+		}
+	}
+	return domain.VerifierOrganization{}, domain.ErrOrganizationNotFound
+}
+
+// primaryOrganization reads the bot's primary organization without locking.
+func primaryOrganization(ctx context.Context, db sqlcgen.DBTX, botID int64) (domain.VerifierOrganization, error) {
+	org, err := scanVerifierOrganization(db.QueryRow(ctx, `
+SELECT `+verifierOrganizationColumnList+`
+FROM verifier_organizations
+WHERE verifier_bot_id = $1
+ORDER BY display_priority, id
+LIMIT 1`, botID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.VerifierOrganization{}, domain.ErrVerifierNotFound
+	}
+	if err != nil {
+		return domain.VerifierOrganization{}, fmt.Errorf("get primary verifier organization: %w", err)
+	}
+	return org, nil
+}
+
+// resolveOrganizationForBot resolves a request's organization: zero means the
+// bot's primary organization, and a non-zero id must name an organization the
+// bot hosts.
+func resolveOrganizationForBot(ctx context.Context, db sqlcgen.DBTX, botID int64, organizationID int64) (domain.VerifierOrganization, error) {
+	if organizationID == 0 {
+		return primaryOrganization(ctx, db, botID)
+	}
+	org, err := scanVerifierOrganization(db.QueryRow(ctx, `
+SELECT `+verifierOrganizationColumnList+`
+FROM verifier_organizations
+WHERE id = $1 AND verifier_bot_id = $2`, organizationID, botID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.VerifierOrganization{}, domain.ErrOrganizationNotFound
+	}
+	if err != nil {
+		return domain.VerifierOrganization{}, fmt.Errorf("get verifier organization for bot: %w", err)
+	}
+	return org, nil
 }
 
 // customVerificationRow adapts the mark projection onto the domain type: the
@@ -1161,15 +1622,17 @@ type customVerificationRow struct {
 
 func (r *customVerificationRow) dest() []any {
 	return []any{
-		&r.mark.ID, &r.mark.VerifierBotID, &r.peerType, &r.mark.Peer.ID,
-		&r.mark.IconDocumentID, &r.mark.Description, &r.mark.GrantedByUserID,
-		&r.mark.CreatedAt, &r.mark.UpdatedAt, &r.mark.Version,
+		&r.mark.ID, &r.mark.OrganizationID, &r.mark.VerifierBotID, &r.peerType,
+		&r.mark.Peer.ID, &r.mark.IconDocumentID, &r.mark.Description,
+		&r.mark.GrantedByUserID, &r.mark.GrantedAt, &r.mark.CreatedAt,
+		&r.mark.UpdatedAt, &r.mark.Version,
 	}
 }
 
 func (r *customVerificationRow) value() domain.CustomVerification {
 	mark := r.mark
 	mark.Peer.Type = domain.PeerType(r.peerType)
+	mark.GrantedAt = mark.GrantedAt.UTC()
 	mark.CreatedAt = mark.CreatedAt.UTC()
 	mark.UpdatedAt = mark.UpdatedAt.UTC()
 	return mark
@@ -1183,19 +1646,19 @@ func scanCustomVerification(row pgx.Row) (domain.CustomVerification, error) {
 	return r.value(), nil
 }
 
-// customVerificationTx reads one verifier's mark on a peer, optionally locking it
-// so a concurrent grant of the same pair serialises behind this one.
-func customVerificationTx(ctx context.Context, db sqlcgen.DBTX, verifierBotID int64, peer domain.Peer, forUpdate bool) (domain.CustomVerification, error) {
+// customVerificationTx reads one organization's mark on a peer, optionally
+// locking it so a concurrent grant of the same pair serialises behind this one.
+func customVerificationTx(ctx context.Context, db sqlcgen.DBTX, organizationID int64, peer domain.Peer, forUpdate bool) (domain.CustomVerification, error) {
 	query := `
 SELECT ` + customVerificationColumnList + `
 FROM custom_verifications
-WHERE verifier_bot_id = $1 AND peer_type = $2 AND peer_id = $3`
+WHERE organization_id = $1 AND peer_type = $2 AND peer_id = $3`
 	if forUpdate {
 		query += `
 FOR UPDATE`
 	}
 	mark, err := scanCustomVerification(db.QueryRow(ctx, query,
-		verifierBotID, string(peer.Type), peer.ID))
+		organizationID, string(peer.Type), peer.ID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.CustomVerification{}, domain.ErrCustomVerificationNotFound
 	}
@@ -1208,7 +1671,9 @@ FOR UPDATE`
 func countCustomVerificationsTx(ctx context.Context, db sqlcgen.DBTX, verifierBotID int64) (int, error) {
 	var count int
 	if err := db.QueryRow(ctx, `
-SELECT count(*) FROM custom_verifications WHERE verifier_bot_id = $1`,
+SELECT count(*) FROM custom_verifications cv
+JOIN verifier_organizations o ON o.id = cv.organization_id
+WHERE o.verifier_bot_id = $1`,
 		verifierBotID).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count custom verifications: %w", err)
 	}
@@ -1216,20 +1681,22 @@ SELECT count(*) FROM custom_verifications WHERE verifier_bot_id = $1`,
 }
 
 // customVerificationRequestRow adapts the application projection: the enum
-// columns arrive as text and approved_at / rejected_at are nullable.
+// columns arrive as text, approved_at / rejected_at / organization_id are
+// nullable (organization_id is cleared by an organization's deletion).
 type customVerificationRequestRow struct {
 	req        domain.CustomVerificationRequest
 	peerType   string
 	status     string
+	orgID      *int64
 	approvedAt *time.Time
 	rejectedAt *time.Time
 }
 
 func (r *customVerificationRequestRow) dest() []any {
 	return []any{
-		&r.req.ID, &r.req.VerifierBotID, &r.req.ApplicantUserID, &r.peerType,
-		&r.req.Peer.ID, &r.req.PeerTitle, &r.req.PeerUsername, &r.req.Reason,
-		&r.req.RequestedDescription, &r.status, &r.req.DecidedBy,
+		&r.req.ID, &r.req.VerifierBotID, &r.orgID, &r.req.ApplicantUserID,
+		&r.peerType, &r.req.Peer.ID, &r.req.PeerTitle, &r.req.PeerUsername,
+		&r.req.Reason, &r.req.RequestedDescription, &r.status, &r.req.DecidedBy,
 		&r.req.DecisionReason, &r.req.InternalNote, &r.req.CorrelationID,
 		&r.req.CreatedAt, &r.req.UpdatedAt, &r.approvedAt, &r.rejectedAt,
 		&r.req.Version,
@@ -1238,6 +1705,9 @@ func (r *customVerificationRequestRow) dest() []any {
 
 func (r *customVerificationRequestRow) value() domain.CustomVerificationRequest {
 	req := r.req
+	if r.orgID != nil {
+		req.OrganizationID = *r.orgID
+	}
 	req.Peer.Type = domain.PeerType(r.peerType)
 	req.Status = domain.CustomVerificationRequestStatus(r.status)
 	req.CreatedAt = req.CreatedAt.UTC()

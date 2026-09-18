@@ -41,23 +41,27 @@ const (
 
 // BotVerificationStore is the in-memory implementation of
 // store.BotVerificationStore. The RPC, bot and admin unit tests run against it,
-// so it reproduces every invariant migration 0155 encodes as an index, a CHECK or
-// a transaction boundary, and returns the same domain errors the PostgreSQL
-// backend maps its violations onto:
+// so it reproduces every invariant migrations 0155 + 0208 encode as an index, a
+// CHECK or a transaction boundary, and returns the same domain errors the
+// PostgreSQL backend maps its violations onto:
 //
 //   - verification_icons.document_id UNIQUE: the catalogue is keyed by document,
 //     so a second upsert of the same document edits the entry in place.
-//   - custom_verifications_peer_once: a peer has at most one wire-visible mark;
-//     another verifier replaces it instead of creating hidden fallback state.
-//   - domain.MaxCustomVerificationsPerVerifier: checked before a mark is created,
-//     never on the update path, so an existing mark can always be re-described.
-//   - the projection: the peer's single mark projects only while its verifier is
-//     enabled, which is the operator kill switch.
-//   - custom_verifications.verifier_bot_id ON DELETE CASCADE: deleting verifier
-//     status takes its marks with it, while applications survive as history
-//     because they reference users instead.
+//   - custom_verifications_org_peer_once: one mark per (organization, peer);
+//     several organizations' marks on the same peer coexist, and the projection
+//     picks the winner. The settings synthesis keeps 0155's bot-level view: a
+//     bot's "settings" is its primary organization's.
+//   - domain.MaxCustomVerificationsPerVerifier: checked per bot before a mark is
+//     created, never on the update path, so an existing mark can always be
+//     re-described.
+//   - the projection: the peer's single visible mark is the winner among the
+//     enabled organizations that mark it -- lowest display_priority, then most
+//     recently granted, then newest row -- which is the operator kill switch.
+//   - custom_verifications.organization_id ON DELETE CASCADE: deleting an
+//     organization takes its marks with it, while applications survive as
+//     history with their organization cleared.
 //   - custom_verification_requests_pending_idx: one live application per
-//     (verifier, peer); a second one is
+//     (organization, peer); a second one is
 //     domain.ErrCustomVerificationRequestExists.
 //   - the approved_at / rejected_at CHECKs: each stamp is paired with its status,
 //     which is why a revocation clears approved_at as it leaves that state.
@@ -78,14 +82,15 @@ type BotVerificationStore struct {
 	// decisions from interleaving inside that window.
 	decideMu        sync.Mutex
 	nextIconID      int64
+	nextOrgID       int64
 	nextMarkID      int64
 	nextRequestID   int64
 	icons           map[int64]domain.VerificationIcon
 	iconsByDocument map[int64]int64
-	verifiers       map[int64]domain.BotVerifierSettings
+	organizations   map[int64]domain.VerifierOrganization
 	marks           map[int64]domain.CustomVerification
 	marksByPeer     map[customVerificationKey]int64
-	// markCounts is the per-verifier mark count the bound is checked against,
+	// markCounts is the per-verifier-bot mark count the bound is checked against,
 	// maintained incrementally so a verifier close to
 	// domain.MaxCustomVerificationsPerVerifier does not turn every grant into a
 	// full scan.
@@ -96,13 +101,11 @@ type BotVerificationStore struct {
 	lastNow time.Time
 }
 
-// customVerificationKey is keyed by peer. verifierBotID is retained in the type
-// only to keep snapshots and helper call sites compact; customVerificationKeyOf
-// deliberately normalizes it to zero.
+// customVerificationKey is keyed by the owning organization and the peer.
 type customVerificationKey struct {
-	verifierBotID int64
-	peerType      domain.PeerType
-	peerID        int64
+	organizationID int64
+	peerType       domain.PeerType
+	peerID         int64
 }
 
 // NewBotVerificationStore creates an empty store. Ids start at 1 so a zero ID
@@ -110,11 +113,12 @@ type customVerificationKey struct {
 func NewBotVerificationStore() *BotVerificationStore {
 	return &BotVerificationStore{
 		nextIconID:      1,
+		nextOrgID:       1,
 		nextMarkID:      1,
 		nextRequestID:   1,
 		icons:           make(map[int64]domain.VerificationIcon),
 		iconsByDocument: make(map[int64]int64),
-		verifiers:       make(map[int64]domain.BotVerifierSettings),
+		organizations:   make(map[int64]domain.VerifierOrganization),
 		marks:           make(map[int64]domain.CustomVerification),
 		marksByPeer:     make(map[customVerificationKey]int64),
 		markCounts:      make(map[int64]int),
@@ -233,13 +237,17 @@ func (s *BotVerificationStore) ListVerificationIcons(_ context.Context, activeOn
 
 // ---- verifier status --------------------------------------------------------
 
-// UpsertBotVerifierSettings grants or updates verifier status.
-//
-// settings.Version is the optimistic-locking expectation: 0 means "there is no
-// verifier row yet" and a stored row then reports
-// domain.ErrCustomVerificationVersionConflict, and a non-zero version must match
-// the stored one. CreatedAt is never rewritten, so the grant date survives every
-// later edit.
+// The legacy bot-level view is synthesized from the bot's primary organization
+// (lowest display_priority, then newest row). A bot with no organizations is
+// not a verifier.
+
+// UpsertBotVerifierSettings grants or updates verifier status through the bot's
+// PRIMARY organization, keeping the 0155 bot-level API. settings.Version is the
+// optimistic-locking expectation: 0 means "the bot has no organization yet", and
+// a bot that already has one then reports
+// domain.ErrCustomVerificationVersionConflict; a non-zero version must match the
+// stored primary organization's. CreatedAt is never rewritten, so the grant date
+// survives every later edit.
 func (s *BotVerificationStore) UpsertBotVerifierSettings(_ context.Context, settings domain.BotVerifierSettings) (domain.BotVerifierSettings, error) {
 	settings.CompanyName = strings.TrimSpace(settings.CompanyName)
 	settings.DefaultDescription = strings.TrimSpace(settings.DefaultDescription)
@@ -254,94 +262,117 @@ func (s *BotVerificationStore) UpsertBotVerifierSettings(_ context.Context, sett
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.nowLocked()
-	current, ok := s.verifiers[settings.BotID]
-	if !ok {
+	orgs := s.organizationsOfBotLocked(settings.BotID, false)
+	if len(orgs) == 0 {
 		if settings.Version != 0 {
-			// The caller edits a row that is no longer there.
 			return domain.BotVerifierSettings{}, domain.ErrVerifierNotFound
 		}
-		stored := settings
-		stored.CreatedAt = now
-		stored.UpdatedAt = now
-		stored.Version = 1
-		s.verifiers[stored.BotID] = stored
-		return stored, nil
+		org := domain.VerifierOrganization{
+			ID:                         s.nextOrgID,
+			VerifierBotID:              settings.BotID,
+			IconDocumentID:             settings.IconDocumentID,
+			CompanyName:                settings.CompanyName,
+			DefaultDescription:         settings.DefaultDescription,
+			CanModifyCustomDescription: settings.CanModifyCustomDescription,
+			Enabled:                    settings.Enabled,
+			DisplayPriority:            domain.DefaultVerifierDisplayPriority,
+			GrantedBy:                  settings.GrantedBy,
+			GrantReason:                settings.GrantReason,
+			CreatedAt:                  now,
+			UpdatedAt:                  now,
+			Version:                    1,
+		}
+		s.nextOrgID++
+		s.organizations[org.ID] = org
+		return org.SettingsFor(), nil
 	}
-	if settings.Version == 0 || settings.Version != current.Version {
+	primary := primaryOrganizationOfLocked(orgs)
+	if settings.Version == 0 || settings.Version != primary.Version {
 		return domain.BotVerifierSettings{}, domain.ErrCustomVerificationVersionConflict
 	}
-	updated := settings
-	updated.CreatedAt = current.CreatedAt
-	updated.UpdatedAt = laterVerificationTime(current.UpdatedAt, now)
-	updated.Version = current.Version + 1
-	s.verifiers[updated.BotID] = updated
-	return updated, nil
+	updated := primary
+	updated.IconDocumentID = settings.IconDocumentID
+	updated.CompanyName = settings.CompanyName
+	updated.DefaultDescription = settings.DefaultDescription
+	updated.CanModifyCustomDescription = settings.CanModifyCustomDescription
+	updated.Enabled = settings.Enabled
+	updated.GrantedBy = settings.GrantedBy
+	updated.GrantReason = settings.GrantReason
+	updated.UpdatedAt = laterVerificationTime(primary.UpdatedAt, now)
+	updated.Version = primary.Version + 1
+	s.organizations[updated.ID] = updated
+	return updated.SettingsFor(), nil
 }
 
-// SetBotVerifierEnabled flips the operator kill switch. Existing marks stay, but
-// the verifier can grant nothing new and neither its settings nor its marks are
-// projected, so flipping the switch back restores exactly what was there.
-// Setting the flag to the value it already has is a no-op and does not burn a
-// version.
+// SetBotVerifierEnabled flips the operator kill switch across every organization
+// of the bot. Existing marks stay, but the verifier can grant nothing new and
+// neither its settings nor its marks are projected, so flipping the switch back
+// restores exactly what was there. Setting the flag to the value it already
+// holds is a no-op and does not burn a version.
 func (s *BotVerificationStore) SetBotVerifierEnabled(_ context.Context, botID int64, enabled bool) (domain.BotVerifierSettings, error) {
 	if botID <= 0 {
 		return domain.BotVerifierSettings{}, domain.ErrVerifierNotFound
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	current, ok := s.verifiers[botID]
-	if !ok {
+	orgs := s.organizationsOfBotLocked(botID, false)
+	if len(orgs) == 0 {
 		return domain.BotVerifierSettings{}, domain.ErrVerifierNotFound
 	}
-	if current.Enabled == enabled {
-		return current, nil
+	unchanged := true
+	for _, org := range orgs {
+		if org.Enabled != enabled {
+			unchanged = false
+			break
+		}
 	}
-	current.Enabled = enabled
-	current.UpdatedAt = laterVerificationTime(current.UpdatedAt, s.nowLocked())
-	current.Version++
-	s.verifiers[botID] = current
-	return current, nil
+	if unchanged {
+		return primaryOrganizationOfLocked(orgs).SettingsFor(), nil
+	}
+	now := s.nowLocked()
+	for _, org := range orgs {
+		org.Enabled = enabled
+		org.UpdatedAt = laterVerificationTime(org.UpdatedAt, now)
+		org.Version++
+		s.organizations[org.ID] = org
+	}
+	return primaryOrganizationOfLocked(s.organizationsOfBotLocked(botID, false)).SettingsFor(), nil
 }
 
-// DeleteBotVerifierSettings removes verifier status. Its marks cascade away with
-// it, because a mark whose verifier no longer exists has nothing to render.
-// Applications survive: they reference users, not the verifier row, and stay as
-// history.
+// DeleteBotVerifierSettings removes verifier status by deleting every
+// organization of the bot. The organizations' marks cascade away with them,
+// because a mark whose verifier no longer exists has nothing to render.
+// Applications survive as history with their organization cleared.
 func (s *BotVerificationStore) DeleteBotVerifierSettings(_ context.Context, botID int64) (bool, error) {
 	if botID <= 0 {
 		return false, domain.ErrVerifierNotFound
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.verifiers[botID]; !ok {
+	orgs := s.organizationsOfBotLocked(botID, false)
+	if len(orgs) == 0 {
 		return false, nil
 	}
-	delete(s.verifiers, botID)
-	for id, mark := range s.marks {
-		if mark.VerifierBotID != botID {
-			continue
-		}
-		delete(s.marks, id)
-		delete(s.marksByPeer, customVerificationKeyOf(mark.VerifierBotID, mark.Peer))
+	for _, org := range orgs {
+		s.deleteOrganizationLocked(org.ID)
 	}
-	delete(s.markCounts, botID)
 	return true, nil
 }
 
-// BotVerifierSettings reads one verifier's status, enabled or not: the caller
-// needs the disabled row too, to render the kill switch and to explain
-// BOT_VERIFIER_FORBIDDEN.
+// BotVerifierSettings reads one verifier's status (its primary organization),
+// enabled or not: the caller needs the disabled row too, to render the kill
+// switch and to explain BOT_VERIFIER_FORBIDDEN.
 func (s *BotVerificationStore) BotVerifierSettings(_ context.Context, botID int64) (domain.BotVerifierSettings, error) {
 	if botID <= 0 {
 		return domain.BotVerifierSettings{}, domain.ErrVerifierNotFound
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	settings, ok := s.verifiers[botID]
-	if !ok {
+	orgs := s.organizationsOfBotLocked(botID, false)
+	if len(orgs) == 0 {
 		return domain.BotVerifierSettings{}, domain.ErrVerifierNotFound
 	}
-	return settings, nil
+	return primaryOrganizationOfLocked(orgs).SettingsFor(), nil
 }
 
 // BotVerifierSettingsBatch resolves several bots at once for the botInfo
@@ -357,42 +388,187 @@ func (s *BotVerificationStore) BotVerifierSettingsBatch(_ context.Context, botID
 		if id <= 0 {
 			continue
 		}
-		if settings, ok := s.verifiers[id]; ok {
-			out[id] = settings
+		if orgs := s.organizationsOfBotLocked(id, false); len(orgs) > 0 {
+			out[id] = primaryOrganizationOfLocked(orgs).SettingsFor()
 		}
 	}
 	return out, nil
 }
 
-// ListBotVerifiers lists verifier bots for the admin panel, ordered by bot id.
+// ListBotVerifiers lists verifier bots for the admin panel, ordered by bot id,
+// one entry per bot carrying its primary organization's settings. enabledOnly
+// keeps bots whose PRIMARY organization is enabled.
 func (s *BotVerificationStore) ListBotVerifiers(_ context.Context, enabledOnly bool, limit int) ([]domain.BotVerifierSettings, error) {
 	limit = botVerificationLimit(limit)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ids := sortedBotVerificationIDs(s.verifiers, true)
 	out := make([]domain.BotVerifierSettings, 0, limit)
-	for _, id := range ids {
+	for _, botID := range sortedBotVerificationBotIDs(s.organizations) {
 		if len(out) == limit {
 			break
 		}
-		settings := s.verifiers[id]
-		if enabledOnly && !settings.Enabled {
+		orgs := s.organizationsOfBotLocked(botID, false)
+		if len(orgs) == 0 {
 			continue
 		}
-		out = append(out, settings)
+		primary := primaryOrganizationOfLocked(orgs)
+		if enabledOnly && !primary.Enabled {
+			continue
+		}
+		out = append(out, primary.SettingsFor())
 	}
 	return out, nil
 }
 
+// ---- organizations ----------------------------------------------------------
+
+// UpsertVerifierOrganization creates (ID == 0) or updates an organization.
+// verifier_bot_id is immutable once set. Version follows the settings
+// convention: 0 means "no such organization yet".
+func (s *BotVerificationStore) UpsertVerifierOrganization(_ context.Context, org domain.VerifierOrganization) (domain.VerifierOrganization, error) {
+	org.CompanyName = strings.TrimSpace(org.CompanyName)
+	org.DefaultDescription = strings.TrimSpace(org.DefaultDescription)
+	org.GrantedBy = strings.TrimSpace(org.GrantedBy)
+	org.GrantReason = strings.TrimSpace(org.GrantReason)
+	if err := org.Validate(); err != nil {
+		return domain.VerifierOrganization{}, err
+	}
+	if org.Version < 0 {
+		return domain.VerifierOrganization{}, domain.ErrVerifierSettingsInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.nowLocked()
+	if org.ID == 0 {
+		stored := org
+		stored.ID = s.nextOrgID
+		stored.CreatedAt = now
+		stored.UpdatedAt = now
+		stored.Version = 1
+		s.nextOrgID++
+		s.organizations[stored.ID] = stored
+		return stored, nil
+	}
+	if org.Version == 0 {
+		return domain.VerifierOrganization{}, domain.ErrCustomVerificationVersionConflict
+	}
+	current, ok := s.organizations[org.ID]
+	if !ok {
+		return domain.VerifierOrganization{}, domain.ErrOrganizationNotFound
+	}
+	if current.VerifierBotID != org.VerifierBotID {
+		return domain.VerifierOrganization{}, domain.ErrVerifierSettingsInvalid
+	}
+	if current.Version != org.Version {
+		return domain.VerifierOrganization{}, domain.ErrCustomVerificationVersionConflict
+	}
+	updated := org
+	updated.VerifierBotID = current.VerifierBotID
+	updated.CreatedAt = current.CreatedAt
+	updated.UpdatedAt = laterVerificationTime(current.UpdatedAt, now)
+	updated.Version = current.Version + 1
+	s.organizations[updated.ID] = updated
+	return updated, nil
+}
+
+// SetVerifierOrganizationEnabled flips one organization's enable bit. The mark
+// rows stay; only the projection stops rendering them. A no-op when already set.
+func (s *BotVerificationStore) SetVerifierOrganizationEnabled(_ context.Context, organizationID int64, enabled bool) (domain.VerifierOrganization, error) {
+	if organizationID <= 0 {
+		return domain.VerifierOrganization{}, domain.ErrOrganizationNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	org, ok := s.organizations[organizationID]
+	if !ok {
+		return domain.VerifierOrganization{}, domain.ErrOrganizationNotFound
+	}
+	if org.Enabled == enabled {
+		return org, nil
+	}
+	org.Enabled = enabled
+	org.UpdatedAt = laterVerificationTime(org.UpdatedAt, s.nowLocked())
+	org.Version++
+	s.organizations[org.ID] = org
+	return org, nil
+}
+
+// DeleteVerifierOrganization removes one organization: its marks cascade away,
+// and its applications keep their history with the organization cleared.
+func (s *BotVerificationStore) DeleteVerifierOrganization(_ context.Context, organizationID int64) (bool, error) {
+	if organizationID <= 0 {
+		return false, domain.ErrOrganizationNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.organizations[organizationID]; !ok {
+		return false, nil
+	}
+	s.deleteOrganizationLocked(organizationID)
+	return true, nil
+}
+
+// VerifierOrganization reads one organization by id.
+func (s *BotVerificationStore) VerifierOrganization(_ context.Context, organizationID int64) (domain.VerifierOrganization, error) {
+	if organizationID <= 0 {
+		return domain.VerifierOrganization{}, domain.ErrOrganizationNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	org, ok := s.organizations[organizationID]
+	if !ok {
+		return domain.VerifierOrganization{}, domain.ErrOrganizationNotFound
+	}
+	return org, nil
+}
+
+// VerifierOrganizationsByBot lists one bot's organizations ranked by
+// display_priority. enabledOnly drops disabled ones.
+func (s *BotVerificationStore) VerifierOrganizationsByBot(_ context.Context, verifierBotID int64, enabledOnly bool) ([]domain.VerifierOrganization, error) {
+	if verifierBotID <= 0 {
+		return nil, domain.ErrVerifierNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.organizationsOfBotLocked(verifierBotID, enabledOnly), nil
+}
+
+// ListVerifierOrganizations is the admin catalogue, grouped by verifier bot.
+func (s *BotVerificationStore) ListVerifierOrganizations(_ context.Context, enabledOnly bool, limit int) ([]domain.VerifierOrganization, error) {
+	limit = botVerificationLimit(limit)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	orgs := make([]domain.VerifierOrganization, 0, len(s.organizations))
+	for _, org := range s.organizations {
+		if enabledOnly && !org.Enabled {
+			continue
+		}
+		orgs = append(orgs, org)
+	}
+	sort.Slice(orgs, func(i, j int) bool {
+		if orgs[i].VerifierBotID != orgs[j].VerifierBotID {
+			return orgs[i].VerifierBotID < orgs[j].VerifierBotID
+		}
+		if orgs[i].DisplayPriority != orgs[j].DisplayPriority {
+			return orgs[i].DisplayPriority < orgs[j].DisplayPriority
+		}
+		return orgs[i].ID < orgs[j].ID
+	})
+	if len(orgs) > limit {
+		orgs = orgs[:limit]
+	}
+	return orgs, nil
+}
+
 // ---- granted marks ---------------------------------------------------------
 
-// GrantCustomVerification creates or updates this verifier's mark on the peer.
+// GrantCustomVerification creates or updates the mark a verifier root owns on a
+// peer, scoped to one ORGANIZATION (mark.OrganizationID; a zero value resolves
+// to the bot's primary organization). A second grant by the same organization is
+// an update reported with created=false; marks of other organizations coexist and
+// the projection picks the winner.
 //
-// The peer is the identity of a mark. A second grant by the same verifier is an
-// update reported with created=false; a different verifier replaces the mark and
-// is reported as a new grant.
-//
-// mark.IconDocumentID is denormalised from the verifier's settings when the
+// mark.IconDocumentID is denormalised from the organization's settings when the
 // caller leaves it unset, which is what "the icon is taken from the verifier at
 // grant time" means; an explicit id is honoured.
 func (s *BotVerificationStore) GrantCustomVerification(_ context.Context, mark domain.CustomVerification) (domain.CustomVerification, bool, error) {
@@ -411,10 +587,9 @@ func (s *BotVerificationStore) GrantCustomVerification(_ context.Context, mark d
 	return s.grantLocked(mark)
 }
 
-// RevokeCustomVerification removes this verifier's mark from the peer and
-// reports whether anything was removed, so a repeated revoke is a no-op instead
-// of an error. Only this verifier's mark goes: another verifier's mark on the
-// same peer is none of its business.
+// RevokeCustomVerification removes this verifier bot's WINNING mark from the
+// peer -- the one its projection would show -- and reports whether anything was
+// removed, so a repeated revoke is a no-op instead of an error.
 func (s *BotVerificationStore) RevokeCustomVerification(_ context.Context, verifierBotID int64, peer domain.Peer) (bool, error) {
 	if verifierBotID <= 0 || !validBotVerificationPeer(peer) {
 		return false, domain.ErrCustomVerificationTargetInvalid
@@ -424,27 +599,58 @@ func (s *BotVerificationStore) RevokeCustomVerification(_ context.Context, verif
 	return s.revokeLocked(verifierBotID, peer), nil
 }
 
-// CustomVerification reads one verifier's mark on a peer, whether or not that
-// verifier is currently enabled: this is the bookkeeping read, not the
-// projection.
+// RevokeOrganizationMark removes one organization's mark on a peer, whether or
+// not it is the projection winner.
+func (s *BotVerificationStore) RevokeOrganizationMark(_ context.Context, organizationID int64, peer domain.Peer) (bool, error) {
+	if organizationID <= 0 || !validBotVerificationPeer(peer) {
+		return false, domain.ErrCustomVerificationTargetInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := customVerificationKeyOf(organizationID, peer)
+	id, found := s.marksByPeer[key]
+	if !found {
+		return false, nil
+	}
+	delete(s.marks, id)
+	delete(s.marksByPeer, key)
+	s.decrementMarkCountLocked(s.marks[id].VerifierBotID)
+	return true, nil
+}
+
+// CustomVerification reads this verifier bot's WINNING mark on a peer, whether
+// or not that verifier is currently enabled: this is the bookkeeping read, not
+// the projection.
 func (s *BotVerificationStore) CustomVerification(_ context.Context, verifierBotID int64, peer domain.Peer) (domain.CustomVerification, error) {
 	if verifierBotID <= 0 || !validBotVerificationPeer(peer) {
 		return domain.CustomVerification{}, domain.ErrCustomVerificationNotFound
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id, ok := s.marksByPeer[customVerificationKeyOf(verifierBotID, peer)]
+	id, found := s.winningMarkOfBotLocked(verifierBotID, peer)
+	if !found {
+		return domain.CustomVerification{}, domain.ErrCustomVerificationNotFound
+	}
+	return s.marks[id], nil
+}
+
+// OrganizationCustomVerification reads one organization's mark on a peer, winner
+// or not.
+func (s *BotVerificationStore) OrganizationCustomVerification(_ context.Context, organizationID int64, peer domain.Peer) (domain.CustomVerification, error) {
+	if organizationID <= 0 || !validBotVerificationPeer(peer) {
+		return domain.CustomVerification{}, domain.ErrCustomVerificationNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.marksByPeer[customVerificationKeyOf(organizationID, peer)]
 	if !ok {
 		return domain.CustomVerification{}, domain.ErrCustomVerificationNotFound
 	}
-	mark := s.marks[id]
-	if mark.VerifierBotID != verifierBotID {
-		return domain.CustomVerification{}, domain.ErrCustomVerificationNotFound
-	}
-	return mark, nil
+	return s.marks[id], nil
 }
 
-// PeerVerification returns the peer's single mark when its verifier is enabled.
+// PeerVerification returns the peer's single visible mark: the winner of the tie
+// between every enabled organization marking the peer.
 func (s *BotVerificationStore) PeerVerification(_ context.Context, peer domain.Peer) (domain.CustomVerification, error) {
 	if !validBotVerificationPeer(peer) {
 		return domain.CustomVerification{}, domain.ErrCustomVerificationNotFound
@@ -461,7 +667,7 @@ func (s *BotVerificationStore) PeerVerification(_ context.Context, peer domain.P
 // PeerVerificationBatch resolves the projection for many peers at once. This is
 // the call on the hot serialisation path, so peers without a mark are simply
 // absent instead of erroring, and every peer resolves through the same
-// same enabled-verifier rule PeerVerification uses.
+// enabled-organization winner rule PeerVerification uses.
 func (s *BotVerificationStore) PeerVerificationBatch(_ context.Context, peers []domain.Peer) (map[domain.Peer]domain.CustomVerification, error) {
 	out := make(map[domain.Peer]domain.CustomVerification, len(peers))
 	s.mu.Lock()
@@ -480,9 +686,9 @@ func (s *BotVerificationStore) PeerVerificationBatch(_ context.Context, peers []
 	return out, nil
 }
 
-// CountCustomVerifications reports how many peers a verifier has marked, for the
-// per-verifier bound. Disabled verifiers still count their marks: the switch
-// hides badges, it does not free quota.
+// CountCustomVerifications reports how many peers a verifier bot has marked
+// across all its organizations, for the per-verifier bound. Disabled verifiers
+// still count their marks: the switch hides badges, it does not free quota.
 func (s *BotVerificationStore) CountCustomVerifications(_ context.Context, verifierBotID int64) (int, error) {
 	if verifierBotID <= 0 {
 		return 0, domain.ErrCustomVerificationTargetInvalid
@@ -495,7 +701,8 @@ func (s *BotVerificationStore) CountCustomVerifications(_ context.Context, verif
 // ListCustomVerifications is the admin listing query with keyset paging over id
 // DESC (filter.BeforeID carries the last row of the previous page). Query matches
 // a mark id or a peer id when it is numeric and otherwise matches the
-// description case-insensitively, the only text a mark carries.
+// description case-insensitively, the only text a mark carries. filter filters by
+// organization when set.
 func (s *BotVerificationStore) ListCustomVerifications(_ context.Context, filter domain.CustomVerificationFilter) ([]domain.CustomVerification, error) {
 	if filter.PeerType != "" && !botVerificationPeerType(filter.PeerType) {
 		return nil, domain.ErrCustomVerificationTargetInvalid
@@ -510,6 +717,9 @@ func (s *BotVerificationStore) ListCustomVerifications(_ context.Context, filter
 			break
 		}
 		mark := s.marks[id]
+		if filter.OrganizationID != 0 && mark.OrganizationID != filter.OrganizationID {
+			continue
+		}
 		if filter.VerifierBotID != 0 && mark.VerifierBotID != filter.VerifierBotID {
 			continue
 		}
@@ -540,9 +750,10 @@ func (s *BotVerificationStore) ListCustomVerifications(_ context.Context, filter
 // A filed application is pending by definition, so the status is forced and any
 // decision field the caller pre-filled is dropped: only
 // DecideCustomVerificationRequest may write those. One live application per
-// (verifier, peer) is allowed, and a second one reports
+// (organization, peer) is allowed, and a second one reports
 // domain.ErrCustomVerificationRequestExists -- two pending rows would let two
-// decisions race for one mark.
+// decisions race for one mark. A zero OrganizationID resolves to the bot's
+// primary organization.
 func (s *BotVerificationStore) CreateCustomVerificationRequest(_ context.Context, req domain.CustomVerificationRequest) (domain.CustomVerificationRequest, error) {
 	req = normalizeCustomVerificationRequest(req)
 	if req.Status == "" {
@@ -561,7 +772,12 @@ func (s *BotVerificationStore) CreateCustomVerificationRequest(_ context.Context
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, found := s.pendingRequestLocked(req.VerifierBotID, req.Peer); found {
+	org, err := s.resolveOrganizationLocked(req.VerifierBotID, req.OrganizationID)
+	if err != nil {
+		return domain.CustomVerificationRequest{}, err
+	}
+	req.OrganizationID = org.ID
+	if _, found := s.pendingRequestLocked(org.ID, req.Peer); found {
 		return domain.CustomVerificationRequest{}, domain.ErrCustomVerificationRequestExists
 	}
 	now := s.nowLocked()
@@ -682,15 +898,19 @@ func (s *BotVerificationStore) CustomVerificationRequest(_ context.Context, requ
 }
 
 // PendingCustomVerificationRequest returns the live application for a
-// (verifier, peer) pair. There is at most one, so no ordering is needed to pick
-// it.
+// (verifier, peer) pair, resolved through the bot's primary organization. There
+// is at most one, so no ordering is needed to pick it.
 func (s *BotVerificationStore) PendingCustomVerificationRequest(_ context.Context, verifierBotID int64, peer domain.Peer) (domain.CustomVerificationRequest, error) {
 	if verifierBotID <= 0 || !validBotVerificationPeer(peer) {
 		return domain.CustomVerificationRequest{}, domain.ErrCustomVerificationRequestNotFound
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	req, found := s.pendingRequestLocked(verifierBotID, peer)
+	orgs := s.organizationsOfBotLocked(verifierBotID, false)
+	if len(orgs) == 0 {
+		return domain.CustomVerificationRequest{}, domain.ErrCustomVerificationRequestNotFound
+	}
+	req, found := s.pendingRequestLocked(primaryOrganizationOfLocked(orgs).ID, peer)
 	if !found {
 		return domain.CustomVerificationRequest{}, domain.ErrCustomVerificationRequestNotFound
 	}
@@ -722,6 +942,9 @@ func (s *BotVerificationStore) ListCustomVerificationRequests(_ context.Context,
 		}
 		req := s.requests[id]
 		if len(filter.Statuses) > 0 && !containsCustomVerificationStatus(filter.Statuses, req.Status) {
+			continue
+		}
+		if filter.OrganizationID != 0 && req.OrganizationID != filter.OrganizationID {
 			continue
 		}
 		if filter.VerifierBotID != 0 && req.VerifierBotID != filter.VerifierBotID {
@@ -784,47 +1007,35 @@ func (s *BotVerificationStore) CustomVerificationRequestCounts(_ context.Context
 // grantLocked is the upsert both the public grant and a decision's apply
 // callback end up in.
 func (s *BotVerificationStore) grantLocked(mark domain.CustomVerification) (domain.CustomVerification, bool, error) {
-	settings, ok := s.verifiers[mark.VerifierBotID]
-	if !ok {
-		return domain.CustomVerification{}, false, domain.ErrVerifierNotFound
+	org, err := s.resolveOrganizationLocked(mark.VerifierBotID, mark.OrganizationID)
+	if err != nil {
+		return domain.CustomVerification{}, false, err
 	}
+	mark.OrganizationID = org.ID
 	if mark.IconDocumentID <= 0 {
-		mark.IconDocumentID = settings.IconDocumentID
+		mark.IconDocumentID = org.IconDocumentID
 	}
 	if err := mark.Validate(); err != nil {
 		return domain.CustomVerification{}, false, err
 	}
 	now := s.nowLocked()
-	key := customVerificationKeyOf(mark.VerifierBotID, mark.Peer)
+	key := customVerificationKeyOf(mark.OrganizationID, mark.Peer)
 	if id, found := s.marksByPeer[key]; found {
 		current := s.marks[id]
-		replaced := current.VerifierBotID != mark.VerifierBotID
-		if replaced {
-			if s.markCounts[mark.VerifierBotID] >= domain.MaxCustomVerificationsPerVerifier {
-				return domain.CustomVerification{}, false, domain.ErrCustomVerificationLimit
-			}
-			if s.markCounts[current.VerifierBotID] <= 1 {
-				delete(s.markCounts, current.VerifierBotID)
-			} else {
-				s.markCounts[current.VerifierBotID]--
-			}
-			s.markCounts[mark.VerifierBotID]++
-			current.VerifierBotID = mark.VerifierBotID
-			current.CreatedAt = now
-		}
 		current.IconDocumentID = mark.IconDocumentID
 		current.Description = mark.Description
 		current.GrantedByUserID = mark.GrantedByUserID
 		current.UpdatedAt = laterVerificationTime(current.UpdatedAt, now)
 		current.Version++
 		s.marks[id] = current
-		return current, replaced, nil
+		return current, false, nil
 	}
 	if s.markCounts[mark.VerifierBotID] >= domain.MaxCustomVerificationsPerVerifier {
 		return domain.CustomVerification{}, false, domain.ErrCustomVerificationLimit
 	}
 	stored := mark
 	stored.ID = s.nextMarkID
+	stored.GrantedAt = now
 	stored.CreatedAt = now
 	stored.UpdatedAt = now
 	stored.Version = 1
@@ -835,26 +1046,21 @@ func (s *BotVerificationStore) grantLocked(mark domain.CustomVerification) (doma
 	return stored, true, nil
 }
 
+// revokeLocked removes the bot's winning mark on the peer.
 func (s *BotVerificationStore) revokeLocked(verifierBotID int64, peer domain.Peer) bool {
-	key := customVerificationKeyOf(verifierBotID, peer)
-	id, found := s.marksByPeer[key]
+	id, found := s.winningMarkOfBotLocked(verifierBotID, peer)
 	if !found {
 		return false
 	}
-	if s.marks[id].VerifierBotID != verifierBotID {
-		return false
-	}
+	mark := s.marks[id]
 	delete(s.marks, id)
-	delete(s.marksByPeer, key)
-	if s.markCounts[verifierBotID] <= 1 {
-		delete(s.markCounts, verifierBotID)
-	} else {
-		s.markCounts[verifierBotID]--
-	}
+	delete(s.marksByPeer, customVerificationKeyOf(mark.OrganizationID, mark.Peer))
+	s.decrementMarkCountLocked(mark.VerifierBotID)
 	return true
 }
 
-// projectedMarkLocked returns the peer's single mark when its verifier is enabled.
+// projectedMarkLocked returns the peer's single visible mark: the winner between
+// the enabled organizations that mark it.
 func (s *BotVerificationStore) projectedMarkLocked(peer domain.Peer) (domain.CustomVerification, bool) {
 	var best domain.CustomVerification
 	found := false
@@ -862,10 +1068,11 @@ func (s *BotVerificationStore) projectedMarkLocked(peer domain.Peer) (domain.Cus
 		if mark.Peer != peer {
 			continue
 		}
-		if settings, ok := s.verifiers[mark.VerifierBotID]; !ok || !settings.Enabled {
+		org, ok := s.organizations[mark.OrganizationID]
+		if !ok || !org.Enabled {
 			continue
 		}
-		if !found || mark.ID > best.ID {
+		if !found || bvMarkBetter(mark, org, best, s.organizations[best.OrganizationID]) {
 			best = mark
 			found = true
 		}
@@ -873,10 +1080,123 @@ func (s *BotVerificationStore) projectedMarkLocked(peer domain.Peer) (domain.Cus
 	return best, found
 }
 
-func (s *BotVerificationStore) pendingRequestLocked(verifierBotID int64, peer domain.Peer) (domain.CustomVerificationRequest, bool) {
+// winningMarkOfBotLocked returns the mark this bot owns on the peer that its
+// projection would show: the winner between the bot's own organizations.
+func (s *BotVerificationStore) winningMarkOfBotLocked(verifierBotID int64, peer domain.Peer) (int64, bool) {
+	var bestID int64
+	found := false
+	for _, mark := range s.marks {
+		if mark.Peer != peer {
+			continue
+		}
+		org, ok := s.organizations[mark.OrganizationID]
+		if !ok || org.VerifierBotID != verifierBotID {
+			continue
+		}
+		if !found || bvMarkBetter(mark, org, s.marks[bestID], s.organizations[s.marks[bestID].OrganizationID]) {
+			bestID = mark.ID
+			found = true
+		}
+	}
+	return bestID, found
+}
+
+// bvMarkBetter is the winner tie-break shared by every projection: lower
+// display_priority, then most recently granted, then newest row.
+func bvMarkBetter(candidate domain.CustomVerification, candidateOrg domain.VerifierOrganization, current domain.CustomVerification, currentOrg domain.VerifierOrganization) bool {
+	if candidateOrg.DisplayPriority != currentOrg.DisplayPriority {
+		return candidateOrg.DisplayPriority < currentOrg.DisplayPriority
+	}
+	if !candidate.GrantedAt.Equal(current.GrantedAt) {
+		return candidate.GrantedAt.After(current.GrantedAt)
+	}
+	return candidate.ID > current.ID
+}
+
+// resolveOrganizationLocked resolves an organization within a bot: zero means
+// the primary, anything else must name an organization the bot hosts.
+func (s *BotVerificationStore) resolveOrganizationLocked(verifierBotID, organizationID int64) (domain.VerifierOrganization, error) {
+	if organizationID == 0 {
+		orgs := s.organizationsOfBotLocked(verifierBotID, false)
+		if len(orgs) == 0 {
+			return domain.VerifierOrganization{}, domain.ErrVerifierNotFound
+		}
+		return primaryOrganizationOfLocked(orgs), nil
+	}
+	org, ok := s.organizations[organizationID]
+	if !ok || org.VerifierBotID != verifierBotID {
+		return domain.VerifierOrganization{}, domain.ErrOrganizationNotFound
+	}
+	return org, nil
+}
+
+// organizationsOfBotLocked lists a bot's organizations ranked by
+// display_priority, so the first entry is always the primary.
+func (s *BotVerificationStore) organizationsOfBotLocked(verifierBotID int64, enabledOnly bool) []domain.VerifierOrganization {
+	orgs := make([]domain.VerifierOrganization, 0, 2)
+	for _, org := range s.organizations {
+		if org.VerifierBotID != verifierBotID {
+			continue
+		}
+		if enabledOnly && !org.Enabled {
+			continue
+		}
+		orgs = append(orgs, org)
+	}
+	sort.Slice(orgs, func(i, j int) bool {
+		if orgs[i].DisplayPriority != orgs[j].DisplayPriority {
+			return orgs[i].DisplayPriority < orgs[j].DisplayPriority
+		}
+		return orgs[i].ID < orgs[j].ID
+	})
+	return orgs
+}
+
+// primaryOrganizationOfLocked picks the primary organization of a ranked list.
+func primaryOrganizationOfLocked(orgs []domain.VerifierOrganization) domain.VerifierOrganization {
+	if len(orgs) == 0 {
+		return domain.VerifierOrganization{}
+	}
+	return orgs[0]
+}
+
+// deleteOrganizationLocked removes an organization and cascades its marks,
+// clearing the organization from its applications' history.
+func (s *BotVerificationStore) deleteOrganizationLocked(organizationID int64) {
+	if _, ok := s.organizations[organizationID]; !ok {
+		return
+	}
+	delete(s.organizations, organizationID)
+	for id, mark := range s.marks {
+		if mark.OrganizationID != organizationID {
+			continue
+		}
+		delete(s.marks, id)
+		delete(s.marksByPeer, customVerificationKeyOf(organizationID, mark.Peer))
+		s.decrementMarkCountLocked(mark.VerifierBotID)
+	}
+	for id, req := range s.requests {
+		if req.OrganizationID == organizationID {
+			req.OrganizationID = 0
+			s.requests[id] = req
+		}
+	}
+}
+
+// decrementMarkCountLocked drops the per-bot mark count, removing the key when
+// it reaches zero.
+func (s *BotVerificationStore) decrementMarkCountLocked(botID int64) {
+	if s.markCounts[botID] <= 1 {
+		delete(s.markCounts, botID)
+	} else {
+		s.markCounts[botID]--
+	}
+}
+
+func (s *BotVerificationStore) pendingRequestLocked(organizationID int64, peer domain.Peer) (domain.CustomVerificationRequest, bool) {
 	for _, id := range sortedBotVerificationIDs(s.requests, true) {
 		req := s.requests[id]
-		if req.VerifierBotID == verifierBotID && req.Peer == peer &&
+		if req.OrganizationID == organizationID && req.Peer == peer &&
 			req.Status == domain.CustomVerificationPending {
 			return req, true
 		}
@@ -889,11 +1209,12 @@ func (s *BotVerificationStore) pendingRequestLocked(verifierBotID int64, peer do
 // decision and whatever its callback wrote.
 type botVerificationSnapshot struct {
 	nextIconID      int64
+	nextOrgID       int64
 	nextMarkID      int64
 	nextRequestID   int64
 	icons           map[int64]domain.VerificationIcon
 	iconsByDocument map[int64]int64
-	verifiers       map[int64]domain.BotVerifierSettings
+	organizations   map[int64]domain.VerifierOrganization
 	marks           map[int64]domain.CustomVerification
 	marksByPeer     map[customVerificationKey]int64
 	markCounts      map[int64]int
@@ -903,11 +1224,12 @@ type botVerificationSnapshot struct {
 func (s *BotVerificationStore) snapshotLocked() botVerificationSnapshot {
 	return botVerificationSnapshot{
 		nextIconID:      s.nextIconID,
+		nextOrgID:       s.nextOrgID,
 		nextMarkID:      s.nextMarkID,
 		nextRequestID:   s.nextRequestID,
 		icons:           copyBotVerificationMap(s.icons),
 		iconsByDocument: copyBotVerificationMap(s.iconsByDocument),
-		verifiers:       copyBotVerificationMap(s.verifiers),
+		organizations:   copyBotVerificationMap(s.organizations),
 		marks:           copyBotVerificationMap(s.marks),
 		marksByPeer:     copyBotVerificationMap(s.marksByPeer),
 		markCounts:      copyBotVerificationMap(s.markCounts),
@@ -917,11 +1239,12 @@ func (s *BotVerificationStore) snapshotLocked() botVerificationSnapshot {
 
 func (s *BotVerificationStore) restoreLocked(snapshot botVerificationSnapshot) {
 	s.nextIconID = snapshot.nextIconID
+	s.nextOrgID = snapshot.nextOrgID
 	s.nextMarkID = snapshot.nextMarkID
 	s.nextRequestID = snapshot.nextRequestID
 	s.icons = snapshot.icons
 	s.iconsByDocument = snapshot.iconsByDocument
-	s.verifiers = snapshot.verifiers
+	s.organizations = snapshot.organizations
 	s.marks = snapshot.marks
 	s.marksByPeer = snapshot.marksByPeer
 	s.markCounts = snapshot.markCounts
@@ -940,11 +1263,11 @@ func (s *BotVerificationStore) nowLocked() time.Time {
 
 // ---- helpers ----------------------------------------------------------------
 
-func customVerificationKeyOf(_ int64, peer domain.Peer) customVerificationKey {
+func customVerificationKeyOf(organizationID int64, peer domain.Peer) customVerificationKey {
 	return customVerificationKey{
-		verifierBotID: 0,
-		peerType:      peer.Type,
-		peerID:        peer.ID,
+		organizationID: organizationID,
+		peerType:       peer.Type,
+		peerID:         peer.ID,
 	}
 }
 
@@ -1041,6 +1364,21 @@ func sortedBotVerificationIDs[V any](items map[int64]V, ascending bool) []int64 
 		return ids[i] > ids[j]
 	})
 	return ids
+}
+
+// sortedBotVerificationBotIDs orders the distinct bots hosting organizations,
+// for the per-bot legacy listings.
+func sortedBotVerificationBotIDs(organizations map[int64]domain.VerifierOrganization) []int64 {
+	seen := make(map[int64]struct{}, len(organizations))
+	for _, org := range organizations {
+		seen[org.VerifierBotID] = struct{}{}
+	}
+	bots := make([]int64, 0, len(seen))
+	for botID := range seen {
+		bots = append(bots, botID)
+	}
+	sort.Slice(bots, func(i, j int) bool { return bots[i] < bots[j] })
+	return bots
 }
 
 func copyBotVerificationMap[K comparable, V any](items map[K]V) map[K]V {
