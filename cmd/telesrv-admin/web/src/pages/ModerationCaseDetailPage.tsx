@@ -192,32 +192,36 @@ export function ModerationCaseDetailPage({ id, navigate }: { id: number; navigat
             </div>
             <section className="section-block">
               <SectionHead title={t("moderation.evidence")} text={t("moderation.evidenceHint")} />
-              <div className="toolbar">
-                {detail.ReportIDs.map((reportID) => (
-                  <button className="btn" key={reportID} onClick={async () => selectReport(await api.moderationReport(reportID))}>
-                    #{reportID}
-                  </button>
-                ))}
+              <div className="detail-stack">
+                <div className="toolbar">
+                  {detail.ReportIDs.map((reportID) => (
+                    <button className="btn" key={reportID} onClick={async () => selectReport(await api.moderationReport(reportID))}>
+                      #{reportID}
+                    </button>
+                  ))}
+                </div>
+                {report && (
+                  <>
+                    <div className="summary-grid">
+                      <Summary
+                        label={t("moderation.sourceAndReason")}
+                        value={`${moderationEnumLabel(t, "source", report.Source)} / ${moderationEnumLabel(t, "reason", report.Reason)}`}
+                      />
+                      <Summary label={t("moderation.reporter")} value={String(report.ReporterUserID)} mono />
+                      <Summary label={t("moderation.option")} value={report.Option} mono />
+                      <Summary label={t("common.time")} value={formatDate(report.CreatedAt)} />
+                    </div>
+                    {report.Comment && <p className="about-text">{report.Comment}</p>}
+                    <ReportEvidence t={t} report={report} />
+                  </>
+                )}
               </div>
-              {report && (
-                <>
-                  <div className="summary-grid">
-                    <Summary
-                      label={t("moderation.sourceAndReason")}
-                      value={`${moderationEnumLabel(t, "source", report.Source)} / ${moderationEnumLabel(t, "reason", report.Reason)}`}
-                    />
-                    <Summary label={t("moderation.reporter")} value={String(report.ReporterUserID)} mono />
-                    <Summary label={t("moderation.option")} value={report.Option} mono />
-                    <Summary label={t("common.time")} value={formatDate(report.CreatedAt)} />
-                  </div>
-                  {report.Comment && <p className="about-text">{report.Comment}</p>}
-                  <ReportEvidence t={t} report={report} />
-                </>
-              )}
             </section>
             <section className="section-block">
               <SectionHead title={t("moderation.decisionAudit")} text={t("moderation.decisionAuditHint")} />
-              <DecisionAudit t={t} detail={detail} />
+              <div className="detail-stack">
+                <DecisionAudit t={t} detail={detail} />
+              </div>
             </section>
             {detail.Appeals.length > 0 && (
               <section className="section-block">
@@ -333,7 +337,7 @@ export function ModerationCaseDetailPage({ id, navigate }: { id: number; navigat
 // evidence gets its own small table so an operator can act on it.
 function ReportEvidence({ t, report }: { t: TFunction; report: ModerationReport }) {
   return (
-    <>
+    <div className="detail-stack">
       <div className="table-wrap">
         <table className="data-table">
           <thead><tr>
@@ -342,16 +346,20 @@ function ReportEvidence({ t, report }: { t: TFunction; report: ModerationReport 
             <th>{t("moderation.itemID")}</th>
             <th>{t("moderation.secondaryID")}</th>
             <th>{t("audit.actor")}</th>
+            <th>{t("messages.body")}</th>
             <th>{t("moderation.snapshot")}</th>
           </tr></thead>
           <tbody>
-            {report.Items.map((evidence, index) => (
+            {report.Items.map((evidence, index) => {
+              const body = messageEvidenceBody(evidence.Evidence);
+              return (
               <tr key={`${evidence.Kind}-${index}`}>
                 <td><Badge>{moderationEnumLabel(t, "itemKind", evidence.Kind)}</Badge></td>
                 <td className="mono">{evidence.Peer ? moderationTargetLabel(t, evidence.Peer.Type, evidence.Peer.ID) : "-"}</td>
                 <td className="mono">{evidence.ItemID || "-"}</td>
                 <td className="mono">{evidence.SecondaryID || "-"}</td>
                 <td className="mono">{evidence.AuthorUserID || "-"}</td>
+                <td className="evidence-message" title={body ?? undefined}>{body ?? "-"}</td>
                 <td>
                   {evidence.Evidence != null
                     ? (
@@ -363,8 +371,9 @@ function ReportEvidence({ t, report }: { t: TFunction; report: ModerationReport 
                     : "-"}
                 </td>
               </tr>
-            ))}
-            {report.Items.length === 0 && <EmptyRow colSpan={6} />}
+              );
+            })}
+            {report.Items.length === 0 && <EmptyRow colSpan={7} />}
           </tbody>
         </table>
       </div>
@@ -391,8 +400,28 @@ function ReportEvidence({ t, report }: { t: TFunction; report: ModerationReport 
           </div>
         </>
       )}
-    </>
+    </div>
   );
+}
+
+// messageEvidenceBody pulls the reported content out of a frozen snapshot so
+// the operator sees what was actually reported instead of having to open the
+// raw JSON disclosure: message items expose their text in `body`,
+// reaction items nest the message under `message.body`, and stories carry the
+// text as `caption`. Anything else has no displayable message.
+function messageEvidenceBody(evidence: unknown): string | null {
+  if (!evidence || typeof evidence !== "object") return null;
+  const snapshot = evidence as Record<string, unknown>;
+  const candidates: unknown[] = [snapshot.body];
+  const message = snapshot.message;
+  if (message && typeof message === "object") {
+    candidates.push((message as Record<string, unknown>).body);
+  }
+  candidates.push(snapshot.caption);
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate;
+  }
+  return null;
 }
 
 // DecisionAudit replaces the decisions/actions JSON dump with two tables: the
@@ -400,7 +429,7 @@ function ReportEvidence({ t, report }: { t: TFunction; report: ModerationReport 
 // (status, attempts, last error, and the payload behind a disclosure).
 function DecisionAudit({ t, detail }: { t: TFunction; detail: ModerationCaseDetail }) {
   return (
-    <>
+    <div className="detail-stack">
       <div className="table-wrap">
         <table className="data-table">
           <thead><tr>
@@ -465,7 +494,7 @@ function DecisionAudit({ t, detail }: { t: TFunction; detail: ModerationCaseDeta
           </tbody>
         </table>
       </div>
-    </>
+    </div>
   );
 }
 

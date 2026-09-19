@@ -48,6 +48,22 @@
   border-radius: var(--radius);
 }
 
+/* Compose detail sub-blocks (summary, tables, disclosures) with a consistent
+   vertical rhythm instead of letting them butt against each other. */
+.detail-stack {
+  display: grid;
+  gap: 10px;
+}
+
+/* Reported-message text column in moderation evidence: clamp long bodies
+   with the full text available on hover. */
+.evidence-message {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .section-block,
 .action-dock,
 .surface {
@@ -828,6 +844,37 @@
 .emoji-id:hover {
   border-color: var(--brand-tint-border);
   color: var(--brand);
+}
+
+/* Click-to-copy inline cell values (e.g. user IDs in the accounts table). */
+.copy-id {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 2px 6px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: inherit;
+}
+
+.copy-id span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.copy-id svg {
+  flex: 0 0 auto;
+}
+
+.copy-id:hover {
+  color: var(--brand);
+  background: var(--panel-subtle);
+  border-color: var(--brand-tint-border);
 }
 
 .emoji-sub {
