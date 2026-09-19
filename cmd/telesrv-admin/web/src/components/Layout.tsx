@@ -17,7 +17,8 @@ import {
   UserRound,
   Gift,
   ScrollText,
-  Settings
+  Settings,
+  Smile
 } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 import { api } from "../api";
@@ -217,7 +218,7 @@ export function Shell({
             </NavLink>
           )}
           <NavLink
-            icon={<span className="nav-emoji" aria-hidden="true">🎬</span>}
+            icon={<Smile size={16} />}
             href="/stickers"
             route={route}
             navigate={navigate}
