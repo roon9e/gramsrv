@@ -34,13 +34,14 @@ import { permissionAuditRead, permissionAdminsManage, permissionBotVerificationR
 import { type Navigate, type RouteState, routeSubtitle, routeTitle } from "../routing";
 import { ThemeSwitch } from "../theme";
 import { AppLink } from "./AppLink";
+import { AppBackground } from "./AppBackground";
 
 export function BootScreen() {
   const { t } = useI18n();
   return (
     <div className="boot-screen">
       <div className="brand compact brand-elevated">
-        <span className="brand-mark">T</span>
+        <span className="brand-mark"><img src="/logo.png" alt="" /></span>
         <span>
           <strong>telesrv</strong>
           <small>{t("app.adminConsole")}</small>
@@ -97,7 +98,7 @@ export function Shell({
     <div className="shell">
       <aside className="sidebar">
         <AppLink className="brand" href="/" navigate={navigate}>
-          <span className="brand-mark">T</span>
+          <span className="brand-mark"><img src="/logo.png" alt="" /></span>
           <span>
             <strong>telesrv</strong>
             <small>{t("app.adminConsole")}</small>
@@ -199,6 +200,7 @@ export function Shell({
         </header>
         <main className="content">{children}</main>
       </div>
+      <AppBackground className="app-background--workspace" />
     </div>
   );
 }
