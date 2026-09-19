@@ -28,12 +28,14 @@ import { BotVerificationPage } from "./BotVerificationPage";
 import { BotVerificationRequestPage } from "./BotVerificationRequestPage";
 import { VerificationDetailPage } from "./VerificationDetailPage";
 import { VerificationPage } from "./VerificationPage";
+import { SharedDevicesPage } from "./SharedDevicesPage";
 import { StoragePage } from "./StoragePage";
 import { StickerSetsPage } from "./StickerSetsPage";
 import { StarsDetailPage } from "./StarsDetailPage";
 import { StarsPage } from "./StarsPage";
 import {
   PermissionGate,
+  permissionAccountsRead,
   permissionAdminsManage,
   permissionAuditRead,
   permissionBotVerificationReview,
@@ -155,6 +157,13 @@ export function Routes({ route, navigate }: { route: RouteState; navigate: Navig
   }
   if (route.path === "/accounts") {
     return <AccountsPage navigate={navigate} />;
+  }
+  if (route.path === "/accounts/shared-devices") {
+    return (
+      <PermissionGate permission={permissionAccountsRead}>
+        <SharedDevicesPage navigate={navigate} />
+      </PermissionGate>
+    );
   }
   if (route.path === "/channels") {
     return <ChannelsPage navigate={navigate} />;

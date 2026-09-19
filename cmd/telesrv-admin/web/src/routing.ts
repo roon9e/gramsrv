@@ -28,6 +28,7 @@ export function routeTitle(pathname: string, t: TFunction): string {
   if (pathname.startsWith("/account-ratings")) return t("route.accountRatings");
   if (pathname.startsWith("/stars")) return t("route.stars");
   if (pathname.startsWith("/storage")) return t("route.storage");
+  if (pathname.startsWith("/accounts/shared-devices")) return t("route.sharedDevices");
   if (pathname.startsWith("/accounts")) return t("route.accounts");
   if (pathname.startsWith("/channels")) return t("route.channels");
   if (pathname.startsWith("/bots")) return t("route.bots");
@@ -54,6 +55,7 @@ export function routeSubtitle(pathname: string, t: TFunction): string {
   if (pathname.startsWith("/account-ratings")) return t("route.accountRatingsSubtitle");
   if (pathname.startsWith("/stars")) return t("route.starsSubtitle");
   if (pathname.startsWith("/storage")) return t("route.storageSubtitle");
+  if (pathname.startsWith("/accounts/shared-devices")) return t("route.sharedDevicesSubtitle");
   if (pathname.startsWith("/accounts")) return t("route.accountsSubtitle");
   if (pathname.startsWith("/channels")) return t("route.channelsSubtitle");
   if (pathname.startsWith("/bots")) return t("route.botsSubtitle");

@@ -42,6 +42,7 @@ import type {
   StorageStatsResponse,
   StarsLedgerResponse,
   StarsTopListResponse,
+  SharedDeviceGroupListResponse,
   VerificationApplicationDetail,
   VerificationApplicationListResponse,
   VerificationCountsResponse
@@ -162,6 +163,7 @@ export const api = {
   logout: () => request<{ ok: boolean }>("/api/logout", { method: "POST", body: "{}" }),
   accounts: (params: URLSearchParams) => request<AccountListResponse>(`/api/accounts?${params.toString()}`),
   account: (id: number) => request<AccountDetail>(`/api/accounts/${id}`),
+  sharedDeviceGroups: (params: URLSearchParams) => request<SharedDeviceGroupListResponse>(`/api/accounts/shared-devices?${params.toString()}`),
   channels: (params: URLSearchParams) => request<ChannelListResponse>(`/api/channels?${params.toString()}`),
   channel: (id: number) => request<ChannelDetail>(`/api/channels/${id}`),
   bots: (params: URLSearchParams) => request<BotListResponse>(`/api/bots?${params.toString()}`),

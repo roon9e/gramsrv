@@ -1448,3 +1448,15 @@
   font-weight: 800;
   letter-spacing: -.02em;
 }
+
+.avatar-col { width: 44px; }
+
+.avatar-link {
+  display: block;
+  padding: 0;
+  line-height: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+}

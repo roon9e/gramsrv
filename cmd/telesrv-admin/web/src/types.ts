@@ -52,6 +52,39 @@ export type AuthorizationRow = {
   ActiveAt: string;
 };
 
+// SharedDeviceAccount is one account whose authorizations matched a
+// SharedDeviceGroup's device fingerprint.
+export type SharedDeviceAccount = {
+  UserID: number;
+  Phone: string;
+  Username: string;
+  FirstName: string;
+  LastName: string;
+  ActiveAt: string;
+};
+
+// SharedDeviceGroup is a device fingerprint (device model + OS + platform +
+// IP) shared by more than one distinct account -- a heuristic multi-account
+// signal, not proof (device_model/system_version are client-reported and
+// spoofable, and IP alone collides behind NAT/shared wifi/carrier CGNAT).
+export type SharedDeviceGroup = {
+  DeviceModel: string;
+  SystemVersion: string;
+  Platform: string;
+  IP: string;
+  AccountCount: number;
+  LastActiveAt: string;
+  Accounts: SharedDeviceAccount[];
+};
+
+export type SharedDeviceGroupListResponse = {
+  limit: number;
+  offset: number;
+  rows: SharedDeviceGroup[];
+  has_more: boolean;
+  next_offset: number;
+};
+
 export type AuditLogRow = {
   ID: number;
   CommandID: string;
