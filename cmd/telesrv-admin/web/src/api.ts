@@ -19,6 +19,9 @@ import type {
   CustomVerificationRequestListResponse,
   VerificationIconListResponse,
   EmojiListResponse,
+  EnvGroup,
+  ServerIdentity,
+  ServerStatus,
   ChannelListResponse,
   CollectibleUsernameDetail,
   CollectibleUsernameListResponse,
@@ -266,6 +269,16 @@ export const api = {
 	setChannelAvatar: (form: FormData) => request<CommandResult>("/api/actions/set-channel-avatar", { method: "POST", body: form }),
   adminUsers: () => request<AdminConsoleUserList>("/api/admin-users"),
   auditLogs: (params: URLSearchParams) => request<AuditLogListResponse>(`/api/audit-logs?${params.toString()}`),
+  // Server Settings -- identity and login-notification template overrides are
+  // saved through the generic action() below; the read side and status probes
+  // have their own GETs, and the icon upload is multipart (a base64 body would
+  // inflate a file ~33% and decodeAction's 1MiB cap would reject it before the
+  // handler ever saw it -- see serversettings.go).
+  serverIdentity: () => request<ServerIdentity>("/api/server/identity"),
+  serverEnv: () => request<EnvGroup[]>("/api/server/env"),
+  serverStatus: () => request<ServerStatus>("/api/server/status"),
+  serverIconURL: (bust = 0) => `/api/server/icon?_=${bust}`,
+  uploadServerIcon: (form: FormData) => request<CommandResult>("/api/actions/upload-server-icon", { method: "POST", body: form }),
   action: (path: string, payload: Record<string, unknown>) => request<CommandResult>(path, {
     method: "POST",
     body: JSON.stringify(payload)

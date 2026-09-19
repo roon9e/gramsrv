@@ -1101,3 +1101,53 @@ export type GroupMessageListResponse = {
   limit: number;
   rows: GroupMessageRow[];
 };
+
+// Server Settings (cmd/telesrv-admin/serversettings.go):
+// identity + login-notification template overrides, .env groups, and the
+// read-only status probes. The optional fields come back omitted when the
+// override is unset (json:"...,omitempty"), so they are undefined rather than
+// "" in that case.
+export type ServerIdentity = {
+  name: string;
+  description: string;
+  icon_ext?: string;
+  welcome_message_phone_template?: string;
+  welcome_message_email_template?: string;
+  login_code_message_template?: string;
+  default_welcome_message_phone_template: string;
+  default_welcome_message_email_template: string;
+  default_login_code_message_template: string;
+};
+
+export type EnvField = {
+  key: string;
+  default_value: string;
+  description: string;
+  enabled_by_default: boolean;
+  sensitive: boolean;
+  value: string;
+};
+
+export type EnvGroup = {
+  title: string;
+  description: string;
+  fields: EnvField[];
+};
+
+export type ServiceHealth = {
+  configured: boolean;
+  ok: boolean;
+  error?: string;
+};
+
+export type ServerStatus = {
+  host: {
+    hostname: string;
+    os: string;
+    arch: string;
+    go_version: string;
+  };
+  postgres: ServiceHealth;
+  redis: ServiceHealth;
+  mtproto: ServiceHealth;
+};

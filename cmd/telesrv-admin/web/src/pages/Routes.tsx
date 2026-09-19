@@ -40,11 +40,13 @@ import {
   permissionAuditRead,
   permissionBotVerificationReview,
   permissionPremiumManage,
+  permissionServerManage,
   permissionStarsRead,
   permissionVerificationReview
 } from "../permissions";
 import { AdminUsersPage } from "./AdminUsersPage";
 import { AuditLogPage } from "./AuditLogPage";
+import { ServerSettingsPage } from "./ServerSettingsPage";
 
 export function Routes({ route, navigate }: { route: RouteState; navigate: Navigate }) {
   const accountID = route.path.match(/^\/accounts\/(\d+)$/)?.[1];
@@ -100,6 +102,13 @@ export function Routes({ route, navigate }: { route: RouteState; navigate: Navig
     return (
       <PermissionGate permission={permissionAuditRead}>
         <AuditLogPage />
+      </PermissionGate>
+    );
+  }
+  if (route.path === "/server-settings") {
+    return (
+      <PermissionGate permission={permissionServerManage}>
+        <ServerSettingsPage search={route.search} />
       </PermissionGate>
     );
   }

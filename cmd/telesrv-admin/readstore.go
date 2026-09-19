@@ -280,6 +280,12 @@ func newReadStore(pool *pgxpool.Pool) *readStore {
 	return &readStore{pool: pool}
 }
 
+// Ping probes the Postgres pool, backing the Server Settings status page's
+// "database" component.
+func (r *readStore) Ping(ctx context.Context) error {
+	return r.pool.Ping(ctx)
+}
+
 // AccountUsername is one collectible (Fragment-style) username a peer holds.
 //
 // Active mirrors the username#b4073647 flag: an inactive collectible is still

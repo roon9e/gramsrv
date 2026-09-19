@@ -23,6 +23,7 @@ export function routeTitle(pathname: string, t: TFunction): string {
   if (pathname.startsWith("/verification")) return t("route.verification");
   if (pathname.startsWith("/admin-users")) return t("route.adminUsers");
   if (pathname.startsWith("/audit-log")) return t("route.auditLog");
+  if (pathname.startsWith("/server-settings")) return t("route.serverSettings");
   if (pathname.startsWith("/collectible-usernames")) return t("route.collectibleUsernames");
   if (pathname.startsWith("/collectible-phones")) return t("route.collectiblePhones");
   if (pathname.startsWith("/account-ratings")) return t("route.accountRatings");
@@ -50,6 +51,7 @@ export function routeSubtitle(pathname: string, t: TFunction): string {
   if (pathname.startsWith("/verification")) return t("route.verificationSubtitle");
   if (pathname.startsWith("/admin-users")) return t("route.adminUsersSubtitle");
   if (pathname.startsWith("/audit-log")) return t("route.auditLogSubtitle");
+  if (pathname.startsWith("/server-settings")) return t("route.serverSettingsSubtitle");
   if (pathname.startsWith("/collectible-usernames")) return t("route.collectibleUsernamesSubtitle");
   if (pathname.startsWith("/collectible-phones")) return t("route.collectiblePhonesSubtitle");
   if (pathname.startsWith("/account-ratings")) return t("route.accountRatingsSubtitle");
