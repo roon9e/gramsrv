@@ -349,6 +349,14 @@ a {
   border-radius: 999px;
 }
 
+/* An emoji standing in for a lucide icon in a nav item: keep it pinned to the
+   same 18px slot the icon grid reserves, so the label column does not shift. */
+.nav-emoji {
+  justify-self: center;
+  font-size: 15px;
+  line-height: 1;
+}
+
 .nav-item:hover,
 .nav-item.active {
   color: var(--sidebar-heading);

@@ -3,7 +3,6 @@ import {
   BadgeCheck,
   Bot,
   Database,
-  Film,
   LayoutDashboard,
   LogOut,
   MessageSquareText,
@@ -180,6 +179,15 @@ export function Shell({
             <NavLink icon={<Star size={16} />} href="/stars" route={route} navigate={navigate}>{t("layout.stars")}</NavLink>
           )}
           <NavLink
+            icon={<Gift size={16} />}
+            href="/gifts"
+            route={route}
+            navigate={navigate}
+            activeWhen={(path) => path.startsWith("/gifts") || path.startsWith("/auctions")}
+          >
+            {t("layout.gifts")}
+          </NavLink>
+          <NavLink
             icon={<BadgeDollarSign size={16} />}
             href={canManagePremium ? "/monetization" : "/give-gifts"}
             route={route}
@@ -197,15 +205,6 @@ export function Shell({
           >
             {t("layout.nftItems")}
           </NavLink>
-          <NavLink
-            icon={<Gift size={16} />}
-            href="/gifts"
-            route={route}
-            navigate={navigate}
-            activeWhen={(path) => path.startsWith("/gifts") || path.startsWith("/auctions")}
-          >
-            {t("layout.gifts")}
-          </NavLink>
           {(canReviewVerification || canReviewBotVerification) && (
             <NavLink
               icon={<BadgeCheck size={16} />}
@@ -218,7 +217,7 @@ export function Shell({
             </NavLink>
           )}
           <NavLink
-            icon={<Film size={16} />}
+            icon={<span className="nav-emoji" aria-hidden="true">🎬</span>}
             href="/stickers"
             route={route}
             navigate={navigate}
