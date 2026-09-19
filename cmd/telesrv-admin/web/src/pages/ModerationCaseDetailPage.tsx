@@ -1,11 +1,12 @@
-import { ArrowLeft, CheckCircle2, RefreshCw, ShieldCheck } from "lucide-react";
+import { ArrowLeft, CheckCircle2, ExternalLink, RefreshCw, ShieldCheck } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api, errorMessage } from "../api";
 import { Alert, Badge, EmptyRow, JsonBlock, LoadingSurface, PageFrame, SectionHead, SplitLayout, Summary } from "../components/ui";
 import { useI18n, type TFunction } from "../i18n";
+import { permissionMessagesRead, useCan } from "../permissions";
 import { formatDate } from "../lib/format";
 import type { Navigate } from "../routing";
-import type { ModerationCaseDetail, ModerationReport } from "../types";
+import type { ModerationCaseDetail, ModerationReport, ModerationReportItem } from "../types";
 import {
   CaseSeverity,
   CaseStatus,
@@ -212,7 +213,7 @@ export function ModerationCaseDetailPage({ id, navigate }: { id: number; navigat
                       <Summary label={t("common.time")} value={formatDate(report.CreatedAt)} />
                     </div>
                     {report.Comment && <p className="about-text">{report.Comment}</p>}
-                    <ReportEvidence t={t} report={report} />
+                    <ReportEvidence t={t} report={report} navigate={navigate} />
                   </>
                 )}
               </div>
@@ -332,10 +333,13 @@ export function ModerationCaseDetailPage({ id, navigate }: { id: number; navigat
 }
 
 // ReportEvidence renders the report's attached evidence as a table (kind,
-// peer, ids, author) with each frozen snapshot tucked behind a disclosure --
-// the friendly successor to dumping the whole report as JSON. Media held as
-// evidence gets its own small table so an operator can act on it.
-function ReportEvidence({ t, report }: { t: TFunction; report: ModerationReport }) {
+// peer, ids, author) with each frozen snapshot tucked behind a disclosure.
+// Reported messages are shown in full -- body wrapped, media hinted -- and the
+// message itself is one click away in the Messages console when the operator
+// has messages.read. Media held as evidence gets its own small table so an
+// operator can act on it.
+function ReportEvidence({ t, report, navigate }: { t: TFunction; report: ModerationReport; navigate: Navigate }) {
+  const canReadMessages = useCan(permissionMessagesRead);
   return (
     <div className="detail-stack">
       <div className="table-wrap">
@@ -352,6 +356,8 @@ function ReportEvidence({ t, report }: { t: TFunction; report: ModerationReport 
           <tbody>
             {report.Items.map((evidence, index) => {
               const body = messageEvidenceBody(evidence.Evidence);
+              const media = messageEvidenceMedia(evidence.Evidence);
+              const openLink = messageConsoleLink(report, evidence);
               return (
               <tr key={`${evidence.Kind}-${index}`}>
                 <td><Badge>{moderationEnumLabel(t, "itemKind", evidence.Kind)}</Badge></td>
@@ -359,7 +365,16 @@ function ReportEvidence({ t, report }: { t: TFunction; report: ModerationReport 
                 <td className="mono">{evidence.ItemID || "-"}</td>
                 <td className="mono">{evidence.SecondaryID || "-"}</td>
                 <td className="mono">{evidence.AuthorUserID || "-"}</td>
-                <td className="evidence-message" title={body ?? undefined}>{body ?? "-"}</td>
+                <td className="evidence-message-cell">
+                  <div className="evidence-message" title={body ?? undefined}>
+                    {body || (media ? `[${media}]` : "-")}
+                  </div>
+                  {openLink && canReadMessages && (
+                    <button className="evidence-open" type="button" onClick={() => navigate(openLink)}>
+                      <ExternalLink size={12} /> {t("moderation.openMessage")}
+                    </button>
+                  )}
+                </td>
                 <td>
                   {evidence.Evidence != null
                     ? (
@@ -420,6 +435,35 @@ function messageEvidenceBody(evidence: unknown): string | null {
   candidates.push(snapshot.caption);
   for (const candidate of candidates) {
     if (typeof candidate === "string" && candidate.trim()) return candidate;
+  }
+  return null;
+}
+
+// messageEvidenceMedia returns the media kind hint (photo, document, poll, ...)
+// when the snapshot carries media but no body, so an attachment-only reported
+// message still reads as a message instead of an empty cell.
+function messageEvidenceMedia(evidence: unknown): string | null {
+  if (!evidence || typeof evidence !== "object") return null;
+  const snapshot = evidence as Record<string, unknown>;
+  if (snapshot.media && typeof snapshot.media === "object") {
+    const kind = (snapshot.media as Record<string, unknown>).kind;
+    if (typeof kind === "string" && kind) return kind;
+  }
+  return null;
+}
+
+// messageConsoleLink deep-links a reported message into the Messages console
+// (both gated by messages.read): private messages were loaded from the
+// reporter's box, so the report's reporter id is the box owner; channel
+// messages address the detail page with the channel peer id. Anything that is
+// not a message item cannot be opened there.
+function messageConsoleLink(report: ModerationReport, evidence: ModerationReportItem): string | null {
+  if (evidence.Kind !== "message" || !evidence.Peer || !evidence.ItemID) return null;
+  if (evidence.Peer.Type === "channel") {
+    return `/messages/groups/detail?channel_id=${evidence.Peer.ID}&msg_id=${evidence.ItemID}`;
+  }
+  if (evidence.Peer.Type === "user" && report.ReporterUserID > 0) {
+    return `/messages/private/detail?owner_user_id=${report.ReporterUserID}&msg_id=${evidence.ItemID}`;
   }
   return null;
 }

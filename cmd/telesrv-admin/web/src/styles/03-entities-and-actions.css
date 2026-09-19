@@ -55,13 +55,39 @@
   gap: 10px;
 }
 
-/* Reported-message text column in moderation evidence: clamp long bodies
-   with the full text available on hover. */
+/* Reported-message column in moderation evidence. The body is the primary
+   evidence for a message report, so it must be readable inline -- wrapped in
+   full -- not clamped to an ellipsis the operator has to hover or dig for. */
+td.evidence-message-cell {
+  vertical-align: top;
+  min-width: 240px;
+}
+
 .evidence-message {
-  max-width: 320px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+/* "Open message" jumps from a report item to the same message in the
+   Messages console, so the operator sees the report in context. */
+.evidence-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  padding: 2px 8px;
+  color: var(--brand);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.evidence-open:hover {
+  background: var(--panel-subtle);
+  border-color: var(--brand-tint-border);
 }
 
 .section-block,
