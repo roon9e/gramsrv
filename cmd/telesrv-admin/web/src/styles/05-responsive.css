@@ -42,7 +42,8 @@
   .overview-metrics,
   .metric-row,
   .summary-grid,
-  .command-steps {
+  .command-steps,
+  .service-grid {
     grid-template-columns: 1fr;
   }
 

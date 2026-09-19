@@ -657,16 +657,6 @@ function ServicesTab() {
             detail={`${status.host.distro || status.host.hostname} \u00b7 ${status.host.os} ${status.host.arch} \u00b7 go ${status.host.go_version}`}
           />
           <ServiceCard
-            icon={<Database size={18} />}
-            name={t("serverSettings.postgres")}
-            {...serviceState(status.postgres)}
-          />
-          <ServiceCard
-            icon={<Layers size={18} />}
-            name={t("serverSettings.redis")}
-            {...serviceState(status.redis)}
-          />
-          <ServiceCard
             icon={<CircleOff size={18} />}
             name={t("serverSettings.mtproto")}
             {...serviceState(status.mtproto)}

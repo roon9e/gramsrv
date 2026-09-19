@@ -9,7 +9,7 @@ import {
   MessageSquareText,
   Megaphone,
   BadgeDollarSign,
-  Coins,
+  Star,
   ShieldAlert,
   ShieldCheck,
   Trophy,
@@ -173,9 +173,30 @@ export function Shell({
         <nav className="nav-list" aria-label={t("layout.primaryNav")}>
           <NavLink icon={<LayoutDashboard size={16} />} href="/" route={route} navigate={navigate}>{t("layout.dashboard")}</NavLink>
           <NavLink icon={<Users size={16} />} href="/accounts" route={route} navigate={navigate}>{t("layout.accounts")}</NavLink>
+          <NavLink icon={<Trophy size={16} />} href="/account-ratings" route={route} navigate={navigate}>{t("layout.accountRatings")}</NavLink>
           <NavLink icon={<ShieldCheck size={16} />} href="/channels" route={route} navigate={navigate}>{t("layout.channels")}</NavLink>
           <NavLink icon={<Bot size={16} />} href="/bots" route={route} navigate={navigate}>{t("layout.bots")}</NavLink>
-          <NavLink icon={<Megaphone size={16} />} href="/broadcasts" route={route} navigate={navigate}>{t("layout.broadcasts")}</NavLink>
+          {canReadStars && (
+            <NavLink icon={<Star size={16} />} href="/stars" route={route} navigate={navigate}>{t("layout.stars")}</NavLink>
+          )}
+          <NavLink
+            icon={<Gift size={16} />}
+            href="/gifts"
+            route={route}
+            navigate={navigate}
+            activeWhen={(path) => path.startsWith("/gifts") || path.startsWith("/auctions")}
+          >
+            {t("layout.gifts")}
+          </NavLink>
+          <NavLink
+            icon={<AtSign size={16} />}
+            href="/collectible-usernames"
+            route={route}
+            navigate={navigate}
+            activeWhen={(path) => path.startsWith("/collectible-usernames") || path.startsWith("/collectible-phones") || path.startsWith("/nft-gifts")}
+          >
+            {t("layout.nftItems")}
+          </NavLink>
           <NavLink
             icon={<BadgeDollarSign size={16} />}
             href={canManagePremium ? "/monetization" : "/give-gifts"}
@@ -185,7 +206,6 @@ export function Shell({
           >
             {t("layout.grants")}
           </NavLink>
-          <NavLink icon={<ShieldAlert size={16} />} href="/moderation" route={route} navigate={navigate}>{t("layout.moderation")}</NavLink>
           {(canReviewVerification || canReviewBotVerification) && (
             <NavLink
               icon={<BadgeCheck size={16} />}
@@ -197,38 +217,8 @@ export function Shell({
               {t("layout.verification")}
             </NavLink>
           )}
-          <NavLink
-            icon={<AtSign size={16} />}
-            href="/collectible-usernames"
-            route={route}
-            navigate={navigate}
-            activeWhen={(path) => path.startsWith("/collectible-usernames") || path.startsWith("/collectible-phones") || path.startsWith("/nft-gifts")}
-          >
-            {t("layout.nftItems")}
-          </NavLink>
-          <NavLink icon={<Trophy size={16} />} href="/account-ratings" route={route} navigate={navigate}>{t("layout.accountRatings")}</NavLink>
-          {canReadStars && (
-            <NavLink icon={<Coins size={16} />} href="/stars" route={route} navigate={navigate}>{t("layout.stars")}</NavLink>
-          )}
-          <NavLink icon={<Database size={16} />} href="/storage" route={route} navigate={navigate}>{t("layout.storage")}</NavLink>
-          <NavLink
-            icon={<Gift size={16} />}
-            href="/gifts"
-            route={route}
-            navigate={navigate}
-            activeWhen={(path) => path.startsWith("/gifts") || path.startsWith("/auctions")}
-          >
-            {t("layout.gifts")}
-          </NavLink>
-          <NavLink
-            icon={<Film size={16} />}
-            href="/stickers"
-            route={route}
-            navigate={navigate}
-            activeWhen={(path) => path.startsWith("/stickers") || path.startsWith("/emoji") || path.startsWith("/gif-catalog")}
-          >
-            {t("layout.media")}
-          </NavLink>
+          <NavLink icon={<Megaphone size={16} />} href="/broadcasts" route={route} navigate={navigate}>{t("layout.broadcasts")}</NavLink>
+          <NavLink icon={<ShieldAlert size={16} />} href="/moderation" route={route} navigate={navigate}>{t("layout.moderation")}</NavLink>
           {canReadMessages && (
             <NavLink
               icon={<MessageSquareText size={16} />}
@@ -240,12 +230,22 @@ export function Shell({
               {t("layout.messages")}
             </NavLink>
           )}
-          {canManageAdmins && (
-            <NavLink icon={<UserCog size={16} />} href="/admin-users" route={route} navigate={navigate}>{t("layout.adminUsers")}</NavLink>
-          )}
           {canReadAudit && (
             <NavLink icon={<ScrollText size={16} />} href="/audit-log" route={route} navigate={navigate}>{t("layout.auditLog")}</NavLink>
           )}
+          {canManageAdmins && (
+            <NavLink icon={<UserCog size={16} />} href="/admin-users" route={route} navigate={navigate}>{t("layout.adminUsers")}</NavLink>
+          )}
+          <NavLink
+            icon={<Film size={16} />}
+            href="/stickers"
+            route={route}
+            navigate={navigate}
+            activeWhen={(path) => path.startsWith("/stickers") || path.startsWith("/emoji") || path.startsWith("/gif-catalog")}
+          >
+            {t("layout.media")}
+          </NavLink>
+          <NavLink icon={<Database size={16} />} href="/storage" route={route} navigate={navigate}>{t("layout.storage")}</NavLink>
           {canManageServer && (
             <NavLink icon={<Settings size={16} />} href="/server-settings" route={route} navigate={navigate}>{t("layout.serverSettings")}</NavLink>
           )}
