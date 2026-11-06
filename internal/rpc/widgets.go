@@ -235,6 +235,15 @@ func (r *Router) onMessagesEditMessageWidgetData(ctx context.Context, req *tg.Me
 	}
 	users := r.usersForMessageUpdate(ctx, userID, self.Message)
 	chats := r.chatsForMessageUpdate(ctx, userID, self.Message)
+	// Emit the schema-native durable updateMessageWidgetData alongside the edit
+	// update: the edit re-sends the message (so the client's snapshot refreshes),
+	// while this event is the pts-bearing widget-data stream entry (difference,
+	// offline replay and proactive delivery).
+	if svc, ok := r.deps.Updates.(MessageWidgetDataUpdatesService); ok {
+		if _, _, err := svc.RecordMessageWidgetData(ctx, rawAuthKeyIDForOrigin(ctx), userID, self.Message); err != nil {
+			r.log.Warn("record message widget data", zap.Error(err))
+		}
+	}
 	return tgEditMessageUpdates(self.Event, self.Message, users, chats), nil
 }
 
