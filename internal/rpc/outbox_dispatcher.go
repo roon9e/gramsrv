@@ -408,7 +408,7 @@ func (d *OutboxDispatcher) dispatchBatch(ctx context.Context, items []store.Disp
 			continue
 		}
 		if sent == 0 {
-			d.notifyOffline(item, requests[i].Event, update)
+			d.notifyOffline(ctx, item, requests[i].Event, update)
 		}
 		delivered = append(delivered, item)
 	}
@@ -486,7 +486,7 @@ func (d *OutboxDispatcher) dispatchPreparedItem(ctx context.Context, item store.
 		return false
 	}
 	if sent == 0 {
-		d.notifyOffline(item, event, update)
+		d.notifyOffline(ctx, item, event, update)
 	}
 	if err := d.outbox.MarkDelivered(ctx, item); err != nil {
 		d.log.Warn("mark dispatch delivered", zap.Int64("target_user_id", item.TargetUserID), zap.Int64("outbox_id", item.ID), zap.Error(err))
@@ -562,7 +562,7 @@ func (d *OutboxDispatcher) pushOutboxUpdate(ctx context.Context, item store.Disp
 
 // notifyOffline hands an update that reached no live session to the offline push
 // bridge (if configured). It runs on an outbox worker and must not block.
-func (d *OutboxDispatcher) notifyOffline(item store.DispatchOutboxItem, event domain.UpdateEvent, update *tg.Updates) {
+func (d *OutboxDispatcher) notifyOffline(ctx context.Context, item store.DispatchOutboxItem, event domain.UpdateEvent, update *tg.Updates) {
 	if d.pusher == nil || update == nil {
 		return
 	}
@@ -573,7 +573,7 @@ func (d *OutboxDispatcher) notifyOffline(item store.DispatchOutboxItem, event do
 	if target == 0 {
 		return
 	}
-	d.pusher.PushOfflineUpdate(target, event, update)
+	d.pusher.PushOfflineUpdate(ctx, target, event, update)
 }
 
 func validateOutboxExclusionPair(item store.DispatchOutboxItem) error {

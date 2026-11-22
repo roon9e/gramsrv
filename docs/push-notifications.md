@@ -1,7 +1,7 @@
 # Push notifications (FCM / APNs)
 
-Status: **FCM implemented, pending fork/production validation**; APNs designed
-but deliberately deferred. Tracking issue:
+Status: **FCM and web push implemented, pending fork/production validation**;
+APNs designed but deliberately deferred. Tracking issue:
 [#98](https://github.com/iamxvbaba/gramsrv/issues/98). This document is the
 scoped design the issue owner asked for before a PR, kept in sync with the
 implementation.
@@ -16,8 +16,10 @@ Implementation map:
   `onAccountUnregisterDevice`), `internal/rpc/deps.go` (`Deps.PushTokens`).
 - Cipher: `internal/push/cipher.go` (MTProto-v2 push encryption).
 - FCM sender: `internal/push/fcm.go` (HTTP v1 + service-account OAuth2).
-- Payload/service: `internal/push/service.go`.
-- Offline trigger: `internal/rpc/offline_push.go`,
+- Web push sender: `internal/push/webpush.go` (RFC 8291/8188 aes128gcm +
+  RFC 8292 VAPID).
+- Payload/service: `internal/push/service.go` (dispatches FCM vs web push).
+- Offline trigger + mute/badge: `internal/rpc/offline_push.go`,
   `internal/rpc/offline_push_payload.go`, and the `WithOfflinePusher` hook in
   `internal/rpc/outbox_dispatcher.go`.
 - Wiring/config: `cmd/telesrv/main.go`, `internal/config/config.go`.
@@ -172,7 +174,7 @@ base64url, following the pattern the wallet/login code already uses for
 file-backed keys. (If reviewers prefer `golang.org/x/oauth2/google`, that is a
 one-line swap — flagged as an open question.)
 
-## 7. FCM sender and payload
+## 7. FCM and web push senders and payload
 
 `internal/push`:
 
@@ -205,6 +207,23 @@ client algorithm, so the round-trip is the golden check.
   `INVALID_ARGUMENT` deletes the row (`ErrTokenUnregistered`) so it is not
   retried forever.
 
+### Web push (token_type 10)
+
+Telegram Web K registers a `PushSubscription` JSON as the token and, when the
+client holds no passcode key (the common case), renders a plain
+`PushNotificationObject` — no MTProto `p`. `internal/push/webpush.go` therefore
+encrypts the notification JSON with RFC 8291 (aes128gcm, RFC 8188) using the
+subscription's `p256dh`/`auth`, and signs a VAPID (RFC 8292) ES256 JWT in the
+`Authorization` header. The sender is validated against the **RFC 8291 section 5
+test vector** in `webpush_test.go`.
+
+Config: `TELESRV_PUSH_WEBPUSH_VAPID_PUBLIC_KEY` (must equal the web build's
+`VITE_PUSH_SERVER_KEY`) and `..._VAPID_PRIVATE_KEY` (base64url), plus optional
+`..._SUBJECT` and `..._TTL`. The private key is required server-side and cannot be
+derived from the public one; a client built with a different public key will
+reject the push. Web push is also encrypted end-to-end to the browser, so the
+push service only sees ciphertext.
+
 ## 8. Offline trigger and coalescing
 
 In `OutboxDispatcher` / `OfflinePushBridge`:
@@ -219,11 +238,15 @@ In `OutboxDispatcher` / `OfflinePushBridge`:
   happens on a small worker pool so it never blocks the outbox.
 - Coalesce per user with a `TELESRV_PUSH_DEBOUNCE` window (default `30s`) so a
   burst of outbox rows produces one push.
+- **Mute / badge refresh**: the bridge reads the peer's `mute_until` (per-peer
+  scope plus the users/chats/broadcasts category default) via the notify-settings
+  store. A muted peer yields a `MESSAGE_MUTED` badge refresh instead of a visible
+  notification, throttled by the same per-user window; a device whose token has
+  `no_muted` is skipped for that refresh.
 - A push failure never blocks, fails, or retries the update row (delivery
   correctness stays with the durable outbox + `getDifference`).
 
-Not yet done: respecting per-peer `mute_until` / per-device `no_muted` (the
-`no_muted`/notify settings are stored but not consulted yet), and APNs.
+Not yet done: APNs.
 
 ## 9. APNs (deferred design)
 

@@ -18,10 +18,11 @@ func privateUpdate(userID, senderID int64, text string, media tg.MessageMediaCla
 }
 
 func TestBuildPushNotificationPrivateText(t *testing.T) {
-	notif, ok := buildPushNotification(1001, privateUpdate(1001, 42, "hello there", nil, nil))
+	target, ok := buildPushTarget(1001, privateUpdate(1001, 42, "hello there", nil, nil))
 	if !ok {
 		t.Fatal("private text message produced no notification")
 	}
+	notif := target.notif
 	if notif.LocKey != "MESSAGE_TEXT" {
 		t.Fatalf("loc_key = %q, want MESSAGE_TEXT", notif.LocKey)
 	}
@@ -31,21 +32,27 @@ func TestBuildPushNotificationPrivateText(t *testing.T) {
 	if notif.Custom["from_id"] != int64(42) || notif.Custom["msg_id"] != 7 {
 		t.Fatalf("custom = %#v", notif.Custom)
 	}
-	if notif.UserID != 1001 {
-		t.Fatalf("user_id = %d, want 1001", notif.UserID)
+	if notif.UserID != 1001 || notif.Title != "Alice Doe" || notif.Description != "hello there" {
+		t.Fatalf("notification = %+v", notif)
+	}
+	if target.peer.ID != 42 || target.category != "users" {
+		t.Fatalf("target peer/category = %+v", target)
 	}
 }
 
 func TestBuildPushNotificationPrivateMediaAndFlags(t *testing.T) {
-	notif, ok := buildPushNotification(1001, privateUpdate(1001, 42, "", &tg.MessageMediaPhoto{}, func(m *tg.Message) { m.Mentioned = true }))
+	target, ok := buildPushTarget(1001, privateUpdate(1001, 42, "", &tg.MessageMediaPhoto{}, func(m *tg.Message) { m.Mentioned = true }))
 	if !ok {
 		t.Fatal("private media message produced no notification")
 	}
-	if notif.LocKey != "MESSAGE_PHOTO" || len(notif.LocArgs) != 1 {
-		t.Fatalf("media notification = %+v", notif)
+	if target.notif.LocKey != "MESSAGE_PHOTO" || len(target.notif.LocArgs) != 1 {
+		t.Fatalf("media notification = %+v", target.notif)
 	}
-	if notif.Custom["mention"] != 1 {
-		t.Fatalf("mention flag missing: %#v", notif.Custom)
+	if target.notif.Custom["mention"] != 1 {
+		t.Fatalf("mention flag missing: %#v", target.notif.Custom)
+	}
+	if target.notif.Description != "Photo" {
+		t.Fatalf("description = %q, want Photo", target.notif.Description)
 	}
 }
 
@@ -56,7 +63,7 @@ func TestBuildPushNotificationSkips(t *testing.T) {
 		"selfchat": privateUpdate(1001, 1001, "x", nil, nil),
 	}
 	for name, updates := range cases {
-		if _, ok := buildPushNotification(1001, updates); ok {
+		if _, ok := buildPushTarget(1001, updates); ok {
 			t.Fatalf("%s message produced a notification, want skip", name)
 		}
 	}
@@ -69,31 +76,37 @@ func TestBuildPushNotificationMegagroupAndChannel(t *testing.T) {
 		Chats:   []tg.ChatClass{&tg.Channel{ID: 100, Title: "Family", Megagroup: true}},
 		Users:   []tg.UserClass{&tg.User{ID: 2, FirstName: "Bob"}},
 	}
-	notif, ok := buildPushNotification(5, megagroup)
+	target, ok := buildPushTarget(5, megagroup)
 	if !ok {
 		t.Fatal("megagroup message produced no notification")
 	}
-	if notif.LocKey != "CHAT_MESSAGE_TEXT" || len(notif.LocArgs) != 3 ||
-		notif.LocArgs[0] != "Bob" || notif.LocArgs[1] != "Family" || notif.LocArgs[2] != "hi group" {
-		t.Fatalf("megagroup notification = %+v", notif)
+	if target.notif.LocKey != "CHAT_MESSAGE_TEXT" || len(target.notif.LocArgs) != 3 ||
+		target.notif.LocArgs[0] != "Bob" || target.notif.LocArgs[1] != "Family" || target.notif.LocArgs[2] != "hi group" {
+		t.Fatalf("megagroup notification = %+v", target.notif)
 	}
-	if notif.Custom["channel_id"] != int64(100) || notif.Custom["chat_from_id"] != int64(2) {
-		t.Fatalf("megagroup custom = %#v", notif.Custom)
+	if target.notif.Custom["channel_id"] != int64(100) || target.notif.Custom["chat_from_id"] != int64(2) {
+		t.Fatalf("megagroup custom = %#v", target.notif.Custom)
+	}
+	if target.category != "chats" || target.notif.Description != "Bob: hi group" {
+		t.Fatalf("megagroup target = %+v", target)
 	}
 
 	broadcast := &tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdateNewChannelMessage{Message: msg}},
 		Chats:   []tg.ChatClass{&tg.Channel{ID: 100, Title: "News", Broadcast: true}},
 	}
-	notif, ok = buildPushNotification(5, broadcast)
+	target, ok = buildPushTarget(5, broadcast)
 	if !ok {
 		t.Fatal("channel post produced no notification")
 	}
-	if notif.LocKey != "CHANNEL_MESSAGE_TEXT" || len(notif.LocArgs) != 2 ||
-		notif.LocArgs[0] != "News" || notif.LocArgs[1] != "hi group" {
-		t.Fatalf("channel notification = %+v", notif)
+	if target.notif.LocKey != "CHANNEL_MESSAGE_TEXT" || len(target.notif.LocArgs) != 2 ||
+		target.notif.LocArgs[0] != "News" || target.notif.LocArgs[1] != "hi group" {
+		t.Fatalf("channel notification = %+v", target.notif)
 	}
-	if _, hasFrom := notif.Custom["chat_from_id"]; hasFrom {
-		t.Fatalf("broadcast custom must not carry chat_from_id: %#v", notif.Custom)
+	if _, hasFrom := target.notif.Custom["chat_from_id"]; hasFrom {
+		t.Fatalf("broadcast custom must not carry chat_from_id: %#v", target.notif.Custom)
+	}
+	if target.category != "broadcasts" {
+		t.Fatalf("broadcast category = %q", target.category)
 	}
 }

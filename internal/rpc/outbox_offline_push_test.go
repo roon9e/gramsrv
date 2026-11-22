@@ -17,7 +17,7 @@ type captureOfflinePusher struct {
 	userID int64
 }
 
-func (p *captureOfflinePusher) PushOfflineUpdate(userID int64, _ domain.UpdateEvent, _ *tg.Updates) {
+func (p *captureOfflinePusher) PushOfflineUpdate(_ context.Context, userID int64, _ domain.UpdateEvent, _ *tg.Updates) {
 	p.calls++
 	p.userID = userID
 }

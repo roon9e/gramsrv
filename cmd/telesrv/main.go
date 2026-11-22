@@ -1143,6 +1143,7 @@ func run(logger *zap.Logger) error {
 	var offlinePushBridge *rpc.OfflinePushBridge
 	if cfg.PushEnabled {
 		pushTokenStore = postgres.NewPushTokenStore(pool)
+		var fcmSender push.Sender
 		if cfg.PushFCMServiceAccountFile != "" {
 			saData, readErr := os.ReadFile(cfg.PushFCMServiceAccountFile)
 			if readErr != nil {
@@ -1155,17 +1156,31 @@ func run(logger *zap.Logger) error {
 			if cfg.PushFCMTokenURL != "" {
 				sa.TokenURI = cfg.PushFCMTokenURL
 			}
-			fcmSender, senderErr := push.NewFCMSender(sa, cfg.PushFCMProjectID, "", cfg.PushFCMScope, cfg.PushSendTimeout)
+			sender, senderErr := push.NewFCMSender(sa, cfg.PushFCMProjectID, "", cfg.PushFCMScope, cfg.PushSendTimeout)
 			if senderErr != nil {
 				return fmt.Errorf("initialize FCM sender: %w", senderErr)
 			}
+			fcmSender = sender
+		}
+		var webPushSender *push.WebPushSender
+		if cfg.PushWebPushVAPIDPrivateKey != "" && cfg.PushWebPushVAPIDPublicKey != "" {
+			sender, senderErr := push.NewWebPushSender(
+				cfg.PushWebPushVAPIDPrivateKey, cfg.PushWebPushVAPIDPublicKey,
+				cfg.PushWebPushSubject, cfg.PushWebPushTTL, cfg.PushSendTimeout,
+			)
+			if senderErr != nil {
+				return fmt.Errorf("initialize web push sender: %w", senderErr)
+			}
+			webPushSender = sender
+		}
+		if fcmSender != nil || webPushSender != nil {
 			offlinePushBridge = rpc.NewOfflinePushBridge(
 				pushTokenStore,
-				push.NewService(fcmSender, logger.Named("push").Named("fcm")),
+				push.NewService(fcmSender, webPushSender, logger.Named("push")),
 				cfg.PushDebounce,
 				clock.System,
 				logger.Named("push").Named("offline"),
-			)
+			).WithNotifyStore(passwordStore)
 		}
 	}
 	codeStore := redisstore.NewCodeStore(rdb)

@@ -6,34 +6,43 @@ import (
 
 	"github.com/iamxvbaba/td/tg"
 
+	"telesrv/internal/domain"
 	"telesrv/internal/push"
 )
 
-// buildPushNotification converts the viewer's already-built TL updates into a
-// push notification, returning false when the event is not a notifiable inbound
-// message.
-func buildPushNotification(userID int64, updates *tg.Updates) (push.Notification, bool) {
+// pushTarget couples the built notification with the peer/category used for the
+// mute check.
+type pushTarget struct {
+	notif    push.Notification
+	peer     domain.Peer
+	category domain.NotifyScopeKind
+}
+
+// buildPushTarget converts the viewer's already-built TL updates into a push
+// notification target, returning false when the event is not a notifiable
+// inbound message.
+func buildPushTarget(userID int64, updates *tg.Updates) (pushTarget, bool) {
 	if updates == nil {
-		return push.Notification{}, false
+		return pushTarget{}, false
 	}
 	for _, u := range updates.Updates {
 		switch m := u.(type) {
 		case *tg.UpdateNewMessage:
 			if msg, ok := m.Message.(*tg.Message); ok {
-				return messageNotification(userID, msg, updates)
+				return messageTarget(userID, msg, updates)
 			}
 		case *tg.UpdateNewChannelMessage:
 			if msg, ok := m.Message.(*tg.Message); ok {
-				return messageNotification(userID, msg, updates)
+				return messageTarget(userID, msg, updates)
 			}
 		}
 	}
-	return push.Notification{}, false
+	return pushTarget{}, false
 }
 
-func messageNotification(userID int64, msg *tg.Message, updates *tg.Updates) (push.Notification, bool) {
+func messageTarget(userID int64, msg *tg.Message, updates *tg.Updates) (pushTarget, bool) {
 	if msg == nil || msg.Out || msg.Silent {
-		return push.Notification{}, false
+		return pushTarget{}, false
 	}
 	custom := map[string]any{"msg_id": msg.ID}
 	if msg.Mentioned {
@@ -44,16 +53,23 @@ func messageNotification(userID int64, msg *tg.Message, updates *tg.Updates) (pu
 		senderID := peerUserID(msg.FromID)
 		if senderID == 0 || senderID == userID {
 			// Self-chat / Saved Messages must not notify the user.
-			return push.Notification{}, false
+			return pushTarget{}, false
 		}
+		name := userNameByID(updates, senderID)
 		custom["from_id"] = senderID
-		return composeMessage(push.Notification{}, "", []string{userNameByID(updates, senderID)}, msg, custom, userID), true
+		notif := composeMessage(push.Notification{}, "", []string{name}, msg, custom, userID)
+		notif.Title = name
+		notif.Description = pushDescription(msg, "")
+		return pushTarget{
+			notif:    notif,
+			peer:     domain.Peer{Type: domain.PeerTypeUser, ID: senderID},
+			category: domain.NotifyScopeUsers,
+		}, true
 	case *tg.PeerChannel:
 		channelID := peer.ChannelID
 		title, megagroup := channelByID(updates, channelID)
 		custom["channel_id"] = channelID
 		if megagroup {
-			// Megagroup: the notification shows both the author and the group.
 			senderName := title
 			if fromUserID := peerUserID(msg.FromID); fromUserID != 0 {
 				senderName = userNameByID(updates, fromUserID)
@@ -62,20 +78,43 @@ func messageNotification(userID int64, msg *tg.Message, updates *tg.Updates) (pu
 				senderName = channelTitleByID(updates, fromChannelID)
 				custom["chat_from_broadcast_id"] = fromChannelID
 			}
-			return composeMessage(push.Notification{}, "CHAT_", []string{senderName, title}, msg, custom, userID), true
+			notif := composeMessage(push.Notification{}, "CHAT_", []string{senderName, title}, msg, custom, userID)
+			notif.Title = title
+			notif.Description = pushDescription(msg, senderName+": ")
+			return pushTarget{
+				notif:    notif,
+				peer:     domain.Peer{Type: domain.PeerTypeChannel, ID: channelID},
+				category: domain.NotifyScopeChats,
+			}, true
 		}
-		return composeMessage(push.Notification{}, "CHANNEL_", []string{title}, msg, custom, userID), true
+		notif := composeMessage(push.Notification{}, "CHANNEL_", []string{title}, msg, custom, userID)
+		notif.Title = title
+		notif.Description = pushDescription(msg, "")
+		return pushTarget{
+			notif:    notif,
+			peer:     domain.Peer{Type: domain.PeerTypeChannel, ID: channelID},
+			category: domain.NotifyScopeBroadcasts,
+		}, true
 	case *tg.PeerChat:
 		chatID := peer.ChatID
 		title, _ := channelByID(updates, chatID)
 		custom["chat_id"] = chatID
 		base := []string{title}
+		senderName := title
 		if senderID := peerUserID(msg.FromID); senderID != 0 {
-			base = []string{userNameByID(updates, senderID), title}
+			senderName = userNameByID(updates, senderID)
+			base = []string{senderName, title}
 		}
-		return composeMessage(push.Notification{}, "CHAT_", base, msg, custom, userID), true
+		notif := composeMessage(push.Notification{}, "CHAT_", base, msg, custom, userID)
+		notif.Title = title
+		notif.Description = pushDescription(msg, senderName+": ")
+		return pushTarget{
+			notif:    notif,
+			peer:     domain.Peer{Type: domain.PeerTypeChannel, ID: chatID},
+			category: domain.NotifyScopeChats,
+		}, true
 	}
-	return push.Notification{}, false
+	return pushTarget{}, false
 }
 
 // composeMessage picks the loc_key/args for a private (MESSAGE_), broadcast
@@ -96,6 +135,31 @@ func composeMessage(n push.Notification, prefix string, base []string, msg *tg.M
 	n.Custom = custom
 	n.UserID = userID
 	return n
+}
+
+// pushDescription is the human-readable body the web service worker renders
+// directly (Android derives it from loc_key/loc_args). prefix, when set, is the
+// "Sender: " group prefix.
+func pushDescription(msg *tg.Message, prefix string) string {
+	if text := strings.TrimSpace(msg.Message); text != "" {
+		return prefix + text
+	}
+	switch mediaLocSuffix(msg.Media) {
+	case "PHOTO":
+		return prefix + "Photo"
+	case "DOC":
+		return prefix + "Document"
+	case "CONTACT":
+		return prefix + "Contact"
+	case "POLL":
+		return prefix + "Poll"
+	case "GEO":
+		return prefix + "Location"
+	case "GEOLIVE":
+		return prefix + "Live location"
+	default:
+		return prefix + "Message"
+	}
 }
 
 func mediaLocSuffix(media tg.MessageMediaClass) string {

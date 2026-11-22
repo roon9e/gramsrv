@@ -26,12 +26,12 @@ func (s *captureSender) Send(_ context.Context, deviceToken string, data map[str
 
 func TestServiceSendSealsPayload(t *testing.T) {
 	sender := &captureSender{}
-	service := NewService(sender, zaptest.NewLogger(t))
+	service := NewService(sender, nil, zaptest.NewLogger(t))
 	secret := make([]byte, 256)
 	for i := range secret {
 		secret[i] = byte(i)
 	}
-	err := service.Send(context.Background(), domain.PushToken{Token: "device-token", Secret: secret}, Notification{
+	err := service.Send(context.Background(), domain.PushToken{TokenType: domain.PushTokenTypeFCM, Token: "device-token", Secret: secret}, Notification{
 		LocKey: "MESSAGE_TEXT", LocArgs: []string{"Alice", "hi"}, UserID: 5,
 	})
 	if err != nil {
@@ -56,12 +56,46 @@ func TestServiceSendSealsPayload(t *testing.T) {
 
 func TestServiceSendSkipsTokenWithoutSecret(t *testing.T) {
 	sender := &captureSender{}
-	service := NewService(sender, zaptest.NewLogger(t))
-	err := service.Send(context.Background(), domain.PushToken{Token: "device-token"}, Notification{LocKey: "MESSAGE_TEXT"})
+	service := NewService(sender, nil, zaptest.NewLogger(t))
+	err := service.Send(context.Background(), domain.PushToken{TokenType: domain.PushTokenTypeFCM, Token: "device-token"}, Notification{LocKey: "MESSAGE_TEXT"})
 	if err != errSecretTooShort {
 		t.Fatalf("no-secret token = %v, want errSecretTooShort", err)
 	}
 	if sender.calls != 0 {
 		t.Fatalf("sender was called %d times for a token without a secret", sender.calls)
+	}
+}
+
+func TestWebPushPayloadShape(t *testing.T) {
+	n := Notification{
+		LocKey:      "MESSAGE_TEXT",
+		LocArgs:     []string{"Alice", "hi"},
+		Custom:      map[string]any{"from_id": int64(42), "msg_id": 7},
+		Title:       "Alice",
+		Description: "hi",
+		UserID:      5,
+	}
+	payload, err := n.webPushPayload(5)
+	if err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(payload, &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if obj["loc_key"] != "MESSAGE_TEXT" || obj["title"] != "Alice" || obj["description"] != "hi" {
+		t.Fatalf("payload = %s", payload)
+	}
+	if obj["mute"] != "0" {
+		t.Fatalf("mute = %v, want 0", obj["mute"])
+	}
+	if obj["user_id"].(float64) != 5 {
+		t.Fatalf("user_id = %v", obj["user_id"])
+	}
+	n.Muted = true
+	payload, _ = n.webPushPayload(5)
+	_ = json.Unmarshal(payload, &obj)
+	if obj["mute"] != "1" {
+		t.Fatalf("muted payload mute = %v, want 1", obj["mute"])
 	}
 }
