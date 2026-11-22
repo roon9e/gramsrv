@@ -13,8 +13,9 @@ const (
 	PushTokenTypeAPNs     = 1
 	PushTokenTypeFCM      = 2
 	PushTokenTypeMPNS     = 3
-	PushTokenTypeAPNsVoIP = 5
-	PushTokenTypeWebPush  = 9
+	PushTokenTypeUbuntu   = 5
+	PushTokenTypeAPNsVoIP = 9
+	PushTokenTypeWebPush  = 10
 )
 
 // PushToken is a device registered to receive push notifications for a user

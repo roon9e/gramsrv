@@ -1,9 +1,26 @@
-# Push notifications (FCM / APNs) — design plan
+# Push notifications (FCM / APNs)
 
-Status: **proposal / not implemented**. Tracking issue:
+Status: **FCM implemented, pending fork/production validation**; APNs designed
+but deliberately deferred. Tracking issue:
 [#98](https://github.com/iamxvbaba/gramsrv/issues/98). This document is the
-scoped design the issue owner asked for before a PR. FCM is the first target;
-APNs is designed but deliberately deferred.
+scoped design the issue owner asked for before a PR, kept in sync with the
+implementation.
+
+Implementation map:
+
+- Token store: `internal/domain/push_token.go`, `internal/store/push_token.go`,
+  `internal/store/memory/push_token.go`,
+  `internal/store/postgres/push_token.go`, migration
+  `deploy/migrations/*_device_push_tokens.up.sql`.
+- RPC: `internal/rpc/account.go` (`onAccountRegisterDevice` /
+  `onAccountUnregisterDevice`), `internal/rpc/deps.go` (`Deps.PushTokens`).
+- Cipher: `internal/push/cipher.go` (MTProto-v2 push encryption).
+- FCM sender: `internal/push/fcm.go` (HTTP v1 + service-account OAuth2).
+- Payload/service: `internal/push/service.go`.
+- Offline trigger: `internal/rpc/offline_push.go`,
+  `internal/rpc/offline_push_payload.go`, and the `WithOfflinePusher` hook in
+  `internal/rpc/outbox_dispatcher.go`.
+- Wiring/config: `cmd/telesrv/main.go`, `internal/config/config.go`.
 
 ## 1. Summary
 
@@ -114,16 +131,18 @@ type PushTokenStore interface {
 
 `internal/rpc/account.go`:
 
-- `registerDevice`: validate `token_type` (FCM/APNs family), reject empty token
-  with `TOKEN_EMPTY`; when `deps.PushTokens == nil` (feature off) return `true`
-  exactly as today. Otherwise upsert and, on a token reassigned from another
-  account, return `TOKEN_WAS_INVALIDATED`-style handling as the clients expect.
+- `registerDevice`: reject an empty token with `TOKEN_EMPTY`; when
+  `deps.PushTokens == nil` (feature off) return `true` exactly as today.
+  Otherwise upsert keyed by `(token_type, token)`, reassigning the token to the
+  caller so it is never pushed for a previous account.
 - `unregisterDevice`: delete the `(user, token_type, token)` row; no-op when
-  the store is absent.
+  the store is absent. Idempotent.
 - `other_uids` are not device rows; they are informational and only stored.
 
-`token_type` handling is table-driven so an unknown type is ignored (stored, not
-pushed) rather than erroring, since layers differ.
+`token_type` handling is table-driven so an unknown type is stored but never
+pushed, since layers differ. Invalidation is provider-driven: an FCM
+`UNREGISTERED` rejection deletes the row rather than storing a separate
+`TOKEN_WAS_INVALIDATED` state (a later `registerDevice` simply re-adds it).
 
 ## 6. Configuration
 
@@ -142,10 +161,10 @@ runs only when both are set. Mirrors the `TELESRV_*` table style in
 | `TELESRV_PUSH_DEBOUNCE` | `30s` | Per-user coalescing window. |
 | `TELESRV_PUSH_SEND_TIMEOUT` | `5s` | Per-request HTTP timeout. |
 
-Every new key must also be added to `.env.example`: `internal/config/drift.go`
-(and its `TestEnvDrift`) warns on unknown/missing keys. Add a
-`validatePushConfig` mirroring `validateTelegramLoginConfig` so "enabled but no
-credentials" fails startup instead of silently no-op'ing.
+Every new key is also in `.env.example`: `internal/config/drift.go` (and its
+`TestEnvDrift`) warns on unknown/missing keys. Startup fails with a clear error
+if `TELESRV_PUSH_FCM_SERVICE_ACCOUNT_FILE` is set but unreadable or malformed;
+push enabled without the file stores tokens but sends nothing.
 
 No new dependency: the OAuth2 service-account JWT (RS256) and the access-token
 exchange are implemented with `crypto/rsa`, `encoding/json`, `net/http` and
@@ -153,51 +172,58 @@ base64url, following the pattern the wallet/login code already uses for
 file-backed keys. (If reviewers prefer `golang.org/x/oauth2/google`, that is a
 one-line swap — flagged as an open question.)
 
-## 7. FCM sender
+## 7. FCM sender and payload
 
-`internal/push` (new package) with:
+`internal/push`:
 
-```go
-type Encryptor interface {
-    // Encrypt returns the TLS-value `p` string for a client token.
-    Encrypt(secret []byte, payload []byte) (string, error)
-}
-type Sender interface {
-    Send(ctx context.Context, device domain.PushToken, payload []byte) error
-}
+- `Sender` — delivers `{"p": <sealed>}` as FCM `data` to one device token.
+- `Service.Send(ctx, domain.PushToken, Notification)` — seals one notification
+  for one token and hands it to the sender. A token without a ≥128-byte secret
+  is skipped (`errSecretTooShort`): the Android client reads only the `p` field,
+  so an FCM push without a secret cannot be rendered.
+
+**FCM HTTP v1**: `POST {base}/v1/projects/{project}/messages:send` with an
+OAuth2 bearer token (`android.priority=high`), `data`-only so the client
+decrypts and renders its own notification.
+
+**Encrypted `p` payload** — matches the official client decryption (verified
+against DrKLO Android `PushListenerController.processRemoteMessage` and the
+`MessageKeyData` derivation):
+
+```text
+blob       = SHA1(secret)[len-8:] || msg_key(16) || AES-IGE(padded_plaintext)
+msg_key    = SHA256(secret[96:128] || padded_plaintext)[8:24]
+aes key/iv = MTProto-v2 MessageKeyData(secret, msg_key, incoming=true) (x=8)
+padded     = int32LE(len(json)) || json || random padding to a 16-byte block
+p          = base64url(blob)   (padded, URL-safe)
 ```
 
-- **FCM HTTP v1**: `POST https://fcm.googleapis.com/v1/projects/{project}/messages:send`
-  with an OAuth2 bearer token; body targets the device token with a `data`
-  payload carrying the encrypted `p` and the plaintext routing hints the
-  clients read (`loc_key`, `badge`, `custom`, etc.). `data` (not `notification`)
-  so the client decrypts and renders its own notification.
-- **Encrypted `p` payload** must match the official clients:
-  `auth_key_id = SHA1(secret)[0:8]`, random 16-byte message key, AES-IGE over the
-  JSON payload, truncated HMAC-SHA256 tag. This is the highest-risk part of the
-  whole feature and gets its own spike with **golden vectors captured from the
-  two client implementations** before any code lands; do not trust this
-  summary, verify against the pinned client sources.
-- **Invalidation**: FCM `UNREGISTERED` / `INVALID_ARGUMENT` responses mark the
-  token invalidated (or delete it) so it is not retried forever.
+`internal/push/cipher_test.go` decrypts with an independent implementation of the
+client algorithm, so the round-trip is the golden check.
+
+- **Invalidation**: FCM `UNREGISTERED` / `NOT_FOUND` / a token-scoped
+  `INVALID_ARGUMENT` deletes the row (`ErrTokenUnregistered`) so it is not
+  retried forever.
 
 ## 8. Offline trigger and coalescing
 
-In `OutboxDispatcher`:
+In `OutboxDispatcher` / `OfflinePushBridge`:
 
-- Only `UpdateEventNewMessage` (and later `UpdateEventChannelState` for channel
-  posts) are push candidates; `read`, `typing`, `presence` and `noop` are not.
-- Respect notify settings: silent for muted peers (`mute_until` in the future)
-  and for `no_muted` device rows.
-- Trigger exactly when `pushOutboxUpdate` returns `sent == 0` and no error
-  (`OnlineUserProvider.IsUserOnline` gives the same answer up front if a
-  standalone dispatcher is preferred).
-- Coalesce per user with a `TELESRV_PUSH_DEBOUNCE` window so a burst of outbox
-  rows produces one push, and cap concurrency with a worker pool so a large
-  fan-out cannot starve the outbox.
-- The trigger is fire-and-forget from the dispatcher's point of view: a push
-  failure never blocks, fails, or retries the update row (delivery correctness
-  stays with the durable outbox + `getDifference`).
+- Only `UpdateEventNewMessage` (covers private messages and channel/megagroup
+  posts) is a push candidate; `read`, `typing`, `presence`, `edit` and `noop`
+  are not. `UpdateEventChannelState` (membership changes) is a future addition.
+- The payload builder skips outgoing, silent and self-chat (Saved Messages)
+  messages, and skips notifications for the sender's own account.
+- Trigger exactly when `pushOutboxUpdate` returns `sent == 0` and no error. The
+  bridge is invoked from the outbox worker and only enqueues; the FCM round-trip
+  happens on a small worker pool so it never blocks the outbox.
+- Coalesce per user with a `TELESRV_PUSH_DEBOUNCE` window (default `30s`) so a
+  burst of outbox rows produces one push.
+- A push failure never blocks, fails, or retries the update row (delivery
+  correctness stays with the durable outbox + `getDifference`).
+
+Not yet done: respecting per-peer `mute_until` / per-device `no_muted` (the
+`no_muted`/notify settings are stored but not consulted yet), and APNs.
 
 ## 9. APNs (deferred design)
 
