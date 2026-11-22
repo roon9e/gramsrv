@@ -127,12 +127,14 @@ pushed) rather than erroring, since layers differ.
 
 ## 6. Configuration
 
-Off by default; a single `Enabled` gate. Mirrors the `TELESRV_*` table style in
+Off by default. `TELESRV_PUSH_ENABLED` is the master switch (gates token
+storage); the FCM sender is configured by the `TELESRV_PUSH_FCM_*` settings and
+runs only when both are set. Mirrors the `TELESRV_*` table style in
 `docs/configuration.en.md` §9 and `.env.example`:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `TELESRV_PUSH_FCM_ENABLED` | `false` | Master switch. |
+| `TELESRV_PUSH_ENABLED` | `false` | Master switch. Off: `registerDevice` stays a no-op and no token is stored. |
 | `TELESRV_PUSH_FCM_SERVICE_ACCOUNT_FILE` | `` | Path to the Firebase service-account JSON (file-backed secret, like the Telegram Login key files — never in `.env`). |
 | `TELESRV_PUSH_FCM_PROJECT_ID` | `` | Firebase project id (falls back to the JSON's `project_id`). |
 | `TELESRV_PUSH_FCM_TOKEN_URL` | `https://oauth2.googleapis.com/token` | Override for tests/proxies. |
