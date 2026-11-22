@@ -144,12 +144,21 @@ func (p *OfflinePushBridge) deliver(ctx context.Context, job offlinePushJob) {
 		}
 		if err := p.service.Send(ctx, token, job.notif); err != nil {
 			if errors.Is(err, push.ErrTokenUnregistered) {
+				p.log.Info("push token invalidated by provider",
+					zap.Int64("user_id", job.userID), zap.Int("token_type", token.TokenType))
 				if _, delErr := p.tokens.DeletePushTokenByValue(ctx, token.TokenType, token.Token); delErr != nil {
 					p.log.Warn("delete invalidated push token", zap.Error(delErr))
 				}
 				continue
 			}
-			p.log.Debug("offline push send failed", zap.Int64("user_id", job.userID), zap.Error(err))
+			p.log.Warn("offline push send failed",
+				zap.Int64("user_id", job.userID), zap.Int("token_type", token.TokenType), zap.Error(err))
+			continue
 		}
+		p.log.Info("offline push sent",
+			zap.Int64("user_id", job.userID),
+			zap.Int("token_type", token.TokenType),
+			zap.String("loc_key", job.notif.LocKey),
+		)
 	}
 }
